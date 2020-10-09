@@ -313,7 +313,11 @@
 		sensor-position-yaw = <180>;
 		actuator-src = <&actuator_main>;
 		led-flash-src = <&led_flash_main>;
+<<<<<<< HEAD:arch/arm64/boot/dts/vendor/qcom/camera/holi-camera-sensor-mot-denver-overlay.dtsi
 		eeprom-src = <&eeprom_main>;
+=======
+		//eeprom-src = <&eeprom_main>;
+>>>>>>> e0172cd61a63 (arm/dt: denver: add flash actuator dts):holi-camera-sensor-mot-denver-overlay.dtsi
 		cam_vio-supply = <&cam_ldo7>;
 		cam_vana-supply = <&cam_ldo3>;
 		cam_vdig-supply = <&cam_ldo1>;
@@ -490,7 +494,11 @@
 		sensor-position-pitch = <0>;
 		sensor-position-yaw = <180>;
 		led-flash-src = <&led_flash_wide>;
+<<<<<<< HEAD:arch/arm64/boot/dts/vendor/qcom/camera/holi-camera-sensor-mot-denver-overlay.dtsi
 		eeprom-src = <&eeprom_wide>;
+=======
+		//eeprom-src = <&eeprom_wide>;
+>>>>>>> e0172cd61a63 (arm/dt: denver: add flash actuator dts):holi-camera-sensor-mot-denver-overlay.dtsi
 		cam_vio-supply = <&cam_ldo7>;
 		cam_vana-supply = <&cam_ldo4>;
 		cam_vdig-supply = <&cam_ldo2>;
@@ -596,7 +604,11 @@
 		sensor-position-pitch = <0>;
 		sensor-position-yaw = <180>;
 		led-flash-src = <&led_flash_macro>;
+<<<<<<< HEAD:arch/arm64/boot/dts/vendor/qcom/camera/holi-camera-sensor-mot-denver-overlay.dtsi
 		eeprom-src = <&eeprom_macro>;
+=======
+		//eeprom-src = <&eeprom_macro>;
+>>>>>>> e0172cd61a63 (arm/dt: denver: add flash actuator dts):holi-camera-sensor-mot-denver-overlay.dtsi
 		cam_vio-supply = <&cam_ldo7>;
 		cam_vana-supply = <&cam_ldo4>;
 		cam_vdig-supply = <&cam_ldo2>;
