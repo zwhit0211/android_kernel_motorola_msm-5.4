@@ -1,182 +1,84 @@
-# How do I submit patches to Android Common Kernels
+# Proton Clang
 
-1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
-   These patches will be merged automatically in the corresponding common kernels. If the patch is already
-   in upstream Linux, post a backport of the patch that conforms to the patch requirements below.
+This is a [LLVM](https://llvm.org/) and [Clang](https://clang.llvm.org/) compiler toolchain built for kernel development. Builds are always made from the latest LLVM sources rather than stable releases, so complete stability cannot be guaranteed.
 
-2. LESS GOOD: Develop your patches out-of-tree (from an upstream Linux point-of-view). Unless these are
-   fixing an Android-specific bug, these are very unlikely to be accepted unless they have been
-   coordinated with kernel-team@android.com. If you want to proceed, post a patch that conforms to the
-   patch requirements below.
+This toolchain targets the AArch32, AArch64, and x86 architectures. It is built with LTO and PGO to reduce compile times as much as possible. [Polly](https://polly.llvm.org/), LLVM's polyhedral loop optimizer, is also included for users who want to experiment with additional optimization. Note that this toolchain is **not** suitable for anything other than bare-metal development; it has not been built with support for any libc or userspace development in mind.
 
-# Common Kernel patch requirements
+[binutils](https://www.gnu.org/software/binutils/) is also included for convenience. Unlike LLVM, however, the latest **stable** version of binutils is always used to reduce the opportunity for breakage because this project is primarily focused on cutting-edge Clang, not binutils. This means that **users do not need to download separate GCC toolchains** to build the Linux kernel.
 
-- All patches must conform to the Linux kernel coding standards and pass `script/checkpatch.pl`
-- Patches shall not break gki_defconfig or allmodconfig builds for arm, arm64, x86, x86_64 architectures
-(see  https://source.android.com/setup/build/building-kernels)
-- If the patch is not merged from an upstream branch, the subject must be tagged with the type of patch:
-`UPSTREAM:`, `BACKPORT:`, `FROMGIT:`, `FROMLIST:`, or `ANDROID:`.
-- All patches must have a `Change-Id:` tag (see https://gerrit-review.googlesource.com/Documentation/user-changeid.html)
-- If an Android bug has been assigned, there must be a `Bug:` tag.
-- All patches must have a `Signed-off-by:` tag by the author and the submitter
+Automated builds occur weekly at 3 PM PST on every Saturday using fresh sources from the [LLVM Git monorepo](https://github.com/llvm/llvm-project). If any part of the builds fail, this repository will not be updated. The build scripts (powered by [tc-build](https://github.com/ClangBuiltLinux/tc-build)) behind this can be found [here](https://github.com/kdrag0n/proton-clang-build).
 
-Additional requirements are listed below based on patch type
+Build notifications and other information can be obtained from the [Telegram channel](https://t.me/proton_clang).
 
-## Requirements for backports from mainline Linux: `UPSTREAM:`, `BACKPORT:`
+## Host compatibility
 
-- If the patch is a cherry-pick from Linux mainline with no changes at all
-    - tag the patch subject with `UPSTREAM:`.
-    - add upstream commit information with a `(cherry-picked from ...)` line
-    - Example:
-        - if the upstream commit message is
-```
-        important patch from upstream
+This toolchain is built on Ubuntu 18.04 LTS, which uses glibc 2.27. Compatibility with older distributions cannot be guaranteed. Other libc implementations (such as musl) are not supported.
 
-        This is the detailed description of the important patch
+## Building Linux
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
-        - then Joe Smith would upload the patch for the common kernel as
-```
-        UPSTREAM: important patch from upstream
+Make sure you have this toolchain in your `PATH`:
 
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry-picked from c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+```bash
+export PATH="$HOME/toolchains/proton-clang/bin:$PATH"
 ```
 
-- If the patch requires any changes from the upstream version, tag the patch with `BACKPORT:`
-instead of `UPSTREAM:`.
-    - use the same tags as `UPSTREAM:`
-    - add comments about the changes under the `(cherry-picked from ...)` line
-    - Example:
-```
-        BACKPORT: important patch from upstream
+For an AArch64 cross-compilation setup, you must set the following variables. Some of them can be environment variables, but some must be passed directly to `make` as a command-line argument. It is recommended to pass **all** of them as `make` arguments to avoid confusing errors:
 
-        This is the detailed description of the important patch
+- `CC=clang` (must be passed directly to `make`)
+- `CROSS_COMPILE=aarch64-linux-gnu-`
+- If your kernel has a 32-bit vDSO: `CROSS_COMPILE_ARM32=arm-linux-gnueabi-`
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+Optionally, you can also choose to use as many LLVM tools as possible to reduce reliance on binutils. All of these must be passed directly to `make`:
 
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry-picked from c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        [ Resolved minor conflict in drivers/foo/bar.c ]
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+- `AR=llvm-ar`
+- `NM=llvm-nm`
+- `OBJCOPY=llvm-objcopy`
+- `OBJDUMP=llvm-objdump`
+- `STRIP=llvm-strip`
 
-## Requirements for other backports: `FROMGIT:`, `FROMLIST:`,
+Note, however, that additional kernel patches may be required for these LLVM tools to work. It is also possible to replace the binutils linkers (`lf.bfd` and `ld.gold`) with `lld` and use Clang's integrated assembler for inline assembly in C code, but that will require many more kernel patches and it is currently impossible to use the integrated assembler for *all* assembly code in the kernel.
 
-- If the patch has been merged into an upstream maintainer tree, but has not yet
-been merged into Linux mainline
-    - tag the patch subject with `FROMGIT:`
-    - add info on where the patch came from as `(cherry picked from commit <sha1> <repo> <branch>)`. This
-must be a stable maintainer branch (not rebased, so don't use `linux-next` for example).
-    - if changes were required, use `BACKPORT: FROMGIT:`
-    - Example:
-        - if the commit message in the maintainer tree is
-```
-        important patch from upstream
+Android kernels older than 4.14 will require patches for compiling with any Clang toolchain to work; those patches are out of the scope of this project. See [android-kernel-clang](https://github.com/nathanchance/android-kernel-clang) for more information.
 
-        This is the detailed description of the important patch
+Android kernels 4.19 and newer use the upstream variable `CROSS_COMPILE_COMPAT`. When building these kernels, replace `CROSS_COMPILE_ARM32` in your commands and scripts with `CROSS_COMPILE_COMPAT`.
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
-        - then Joe Smith would upload the patch for the common kernel as
-```
-        FROMGIT: important patch from upstream
+### Differences from other toolchains
 
-        This is the detailed description of the important patch
+Proton Clang has been designed to be easy-to-use compared to other toolchains, such as [AOSP Clang](https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/). The differences are as follows:
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+- `CLANG_TRIPLE` does not need to be set because we don't use AOSP binutils
+- `LD_LIBRARY_PATH` does not need to be set because we set library load paths in the toolchain
+- No separate GCC/binutils toolchains are necessary; all tools are bundled
 
-        Bug: 135791357
-        (cherry picked from commit 878a2fd9de10b03d11d2f622250285c7e63deace
-         https://git.kernel.org/pub/scm/linux/kernel/git/foo/bar.git test-branch)
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+## Common problems
+
+### `as: unrecognized option '-EL'`
+
+Usually, this means that `CROSS_COMPILE` is not set correctly. Check that variable as well as your `PATH` to make sure that the required tools are available for Clang to invoke. You can test it manually like tihs:
+
+```bash
+$ ${CROSS_COMPILE}ld -v
+GNU ld (GNU Binutils) 2.34
 ```
 
+If you see `Command not found` or any other error, one of the two variables mentioned above is most likely set incorrectly.
 
-- If the patch has been submitted to LKML, but not accepted into any maintainer tree
-    - tag the patch subject with `FROMLIST:`
-    - add a `Link:` tag with a link to the submittal on lore.kernel.org
-    - if changes were required, use `BACKPORT: FROMLIST:`
-    - Example:
-```
-        FROMLIST: important patch from upstream
+If you continue to encounter this error after verifying `CROSS_COMPILE` and `PATH`, you are probably running into a change in Clang 12's handling of cross-compiling. The fix is to either merge linux-stable (which already has the fix included) cherry-pick ["Makefile: Fix GCC_TOOLCHAIN_DIR prefix for Clang cross compilation"](https://github.com/kdrag0n/proton_zf6/commit/6e87fec9a3df5) manually.
 
-        This is the detailed description of the important patch
+If the error still continues to appear and you have an arm64 kernel that includes vdso32, you will also need to cherry-pick ["arm64: vdso32: Fix '--prefix=' value for newer versions of clang"](https://github.com/kdrag0n/proton_zf6/commit/68acd6966ac98) to fix the second vdso32 error. Merging linux-stable is also an option if you are on Linux 5.4 or newer.
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+### `Cannot use CONFIG_CC_STACKPROTECTOR_STRONG: -fstack-protector-strong not supported by compiler`
 
-        Bug: 135791357
-        Link: https://lore.kernel.org/lkml/20190619171517.GA17557@someone.com/
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+This error is actually a result of stack protector checks in the Makefile that cause the real error to be masked. It indicates that one or more unsupported compiler flags have been passed to Clang. Disable `CONFIG_CC_STACKPROTECTOR_STRONG` in favor of `CONFIG_CC_STACKPROTECTOR_NONE` temporarily (make sure you don't keep this change permanently for security reasons) and Clang will output the flag that is causing the problem.
 
-## Requirements for Android-specific patches: `ANDROID:`
+In downstream kernels, the cause is usually big.LITTLE CPU optimization flags that have been added to the Makefile unconditionally. The correct solution is to check `cc-name` for the current compiler and adjust the optimization flags accordingly — big.LITTLE for GCC and little-only for Clang. See ["Makefile: Optimize for sm8150's Kryo 485 CPU setup"](https://github.com/kdrag0n/proton_zf6/commit/f45e4ffbecd1c059aa49d8a119b50ee84d7f9d0f) for an example implementation of this.
 
-- If the patch is fixing a bug to Android-specific code
-    - tag the patch subject with `ANDROID:`
-    - add a `Fixes:` tag that cites the patch with the bug
-    - Example:
-```
-        ANDROID: fix android-specific bug in foobar.c
+### `scripts/gcc-version.sh: line 25: aarch64-linux-gnu-gcc: command not found`
 
-        This is the detailed description of the important fix
+This is caused by unconditional invocations of `gcc-version.sh` in CAF's camera_v2 driver. The recommended solution is to cherry-pick [Google's fix](https://android.googlesource.com/kernel/msm/+/9b3a54e388fae0fcc5ea64a4c612936baae44fce) from the Pixel 2 kernel, which simply removes the faulty invocations as they were never useful to begin with.
 
-        Fixes: 1234abcd2468 ("foobar: add cool feature")
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+Note that these errors are harmless and don't necessarily need to be fixed, but nonetheless, ignoring them is not recommended.
 
-- If the patch is a new feature
-    - tag the patch subject with `ANDROID:`
-    - add a `Bug:` tag with the Android bug (required for android-specific features)
+### `undefined reference to 'stpcpy'`
 
-# Vibrator driver for HHG device
-## How to merge the driver into kernel source tree
-
- 1. Copy \${this_project}/drivers/hid/hid-aksys.c into \${your_kernel_root}/drivers/hid/
-
- 2. Compare and merge \${this_project}/drivers/hid/hid-ids.h into \${your_kernel_root}/drivers/hid/hid-ids.h :
- Add the following code before the last line of this file
-
-    ```c
-		#define USB_VENDER_ID_QUALCOMM  0x0a12
-		#define USB_VENDER_ID_TEMP_HHG_AKSY 0x1234
-		#define USB_PRODUCT_ID_AKSYS_HHG  0x1000
-    ```
-
- 3. Merge \${this_project}/drivers/hid/Kconfig into \${your_kernel_root}/drivers/hid/Kconfig :
-Add the following code before the last line of this file
-
-		config HID_AKSYS_QRD
-    		tristate "AKSys gamepad USB adapter support"
-    		depends on HID
-    		---help---
-    		Support for AKSys gamepad USB adapter
-
-    	config AKSYS_QRD_FF
-    		bool "AKSys gamepad USB adapter force feedback support"
-    		depends on HID_AKSYS_QRD
-    		select INPUT_FF_MEMLESS
-    		---help---
-    		Say Y here if you have a AKSys gamepad USB adapter and want to
-    		enable force feedback support for it.
-    		
- 4. Merge \${this_project}/drivers/hid/Makefile into \${your_kernel_root}/drivers/hid/Makefile :
- Add the following code at the end of this file
-
-		obj-$(CONFIG_HID_AKSYS_QRD)	+= hid-aksys.o
-		
- 5. Modify your kernel's default build configuration file. Add the following two lines:
-
-        CONFIG_HID_AKSYS_QRD=m
-        CONFIG_AKSYS_QRD_FF=y
+This is caused by a libcall optimization added in Clang 12 that optimizes certain basic `sprintf` calls into `stpcpy` calls. The correct fix for this is to cherry-pick ["lib/string.c: implement stpcpy"](https://github.com/kdrag0n/proton_zf6/commit/cec73f0775526), which adds a simple implementation of `stpcpy` to the kernel so that Clang can use it.
