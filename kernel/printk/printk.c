@@ -55,8 +55,6 @@
 #include <trace/events/initcall.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/printk.h>
-#undef CREATE_TRACE_POINTS
-#include <trace/hooks/debug.h>
 
 #include "console_cmdline.h"
 #include "braille.h"
@@ -451,7 +449,7 @@ static u32 clear_idx;
 #else
 #define PREFIX_MAX		32
 #endif
-#define LOG_LINE_MAX		(3072 - PREFIX_MAX)
+#define LOG_LINE_MAX		(1024 - PREFIX_MAX)
 
 #define LOG_LEVEL(v)		((v) & 0x07)
 #define LOG_FACILITY(v)		((v) >> 3 & 0xff)
@@ -459,7 +457,7 @@ static u32 clear_idx;
 /* record buffer */
 #define LOG_ALIGN __alignof__(struct printk_log)
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
-#define LOG_BUF_LEN_MAX (u32)(1 << 31)
+#define LOG_BUF_LEN_MAX ((u32)1 << 31)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
@@ -616,47 +614,6 @@ static u32 truncate_msg(u16 *text_len, u16 *trunc_msg_len,
 	return msg_used_size(*text_len + *trunc_msg_len, 0, pad_len);
 }
 
-#ifdef CONFIG_QCOM_INITIAL_LOGBUF
-static inline void copy_boot_log(struct printk_log *msg)
-{
-	unsigned int bytes_to_copy;
-	unsigned int avail_buf;
-	static unsigned int boot_log_offset;
-
-	if (!boot_log_buf)
-		goto out;
-
-	avail_buf = boot_log_buf_size - boot_log_offset;
-	if (!avail_buf || (avail_buf < sizeof(*msg)))
-		goto out;
-
-	if (copy_early_boot_log) {
-		bytes_to_copy = log_next_idx;
-
-		if (avail_buf < bytes_to_copy)
-			bytes_to_copy = avail_buf;
-
-		memcpy(boot_log_buf + boot_log_offset, log_buf, bytes_to_copy);
-		boot_log_offset += bytes_to_copy;
-		copy_early_boot_log = false;
-		goto out;
-	}
-
-	bytes_to_copy = msg->len;
-	if (!bytes_to_copy)
-		bytes_to_copy = sizeof(*msg);
-
-	if (avail_buf < bytes_to_copy)
-		bytes_to_copy = avail_buf;
-
-	memcpy(boot_log_buf + boot_log_offset, msg, bytes_to_copy);
-	boot_log_offset += bytes_to_copy;
-
-out:
-	return;
-}
-#endif
-
 /* insert record into the buffer, discard old ones, update heads */
 static int log_store(u32 caller_id, int facility, int level,
 		     enum log_flags flags, u64 ts_nsec,
@@ -715,9 +672,6 @@ static int log_store(u32 caller_id, int facility, int level,
 	/* insert message */
 	log_next_idx += msg->len;
 	log_next_seq++;
-#ifdef CONFIG_QCOM_INITIAL_LOGBUF
-	copy_boot_log(msg);
-#endif
 
 	return msg->text_len;
 }
@@ -1833,6 +1787,12 @@ static int console_trylock_spinning(void)
 	 */
 	mutex_acquire(&console_lock_dep_map, 0, 1, _THIS_IP_);
 
+	/*
+	 * Update @console_may_schedule for trylock because the previous
+	 * owner may have been schedulable.
+	 */
+	console_may_schedule = 0;
+
 	return 1;
 }
 
@@ -2055,7 +2015,6 @@ asmlinkage int vprintk_emit(int facility, int level,
 	pending_output = (curr_log_seq != log_next_seq);
 	logbuf_unlock_irqrestore(flags);
 
-	trace_android_vh_printk_store(facility, level);
 	/* If called from the scheduler, we can not call up(). */
 	if (!in_sched && pending_output) {
 		/*
@@ -2342,8 +2301,6 @@ void resume_console(void)
 	console_unlock();
 }
 
-#ifdef CONFIG_CONSOLE_FLUSH_ON_HOTPLUG
-
 /**
  * console_cpu_notify - print deferred console messages after CPU hotplug
  * @cpu: unused
@@ -2362,8 +2319,6 @@ static int console_cpu_notify(unsigned int cpu)
 	}
 	return 0;
 }
-
-#endif
 
 /**
  * console_lock - lock the console system for exclusive use.
@@ -2995,7 +2950,7 @@ void __init console_init(void)
 static int __init printk_late_init(void)
 {
 	struct console *con;
-	int ret = 0;
+	int ret;
 
 	for_each_console(con) {
 		if (!(con->flags & CON_BOOT))
@@ -3017,15 +2972,13 @@ static int __init printk_late_init(void)
 			unregister_console(con);
 		}
 	}
-#ifdef CONFIG_CONSOLE_FLUSH_ON_HOTPLUG
 	ret = cpuhp_setup_state_nocalls(CPUHP_PRINTK_DEAD, "printk:dead", NULL,
 					console_cpu_notify);
 	WARN_ON(ret < 0);
 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "printk:online",
 					console_cpu_notify, NULL);
 	WARN_ON(ret < 0);
-#endif
-	return ret;
+	return 0;
 }
 late_initcall(printk_late_init);
 

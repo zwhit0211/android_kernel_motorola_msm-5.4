@@ -168,24 +168,15 @@ static int snd_compr_free(struct inode *inode, struct file *f)
 static int snd_compr_update_tstamp(struct snd_compr_stream *stream,
 		struct snd_compr_tstamp *tstamp)
 {
-	int err = 0;
 	if (!stream->ops->pointer)
 		return -ENOTSUPP;
-	err = stream->ops->pointer(stream, tstamp);
-	if (err)
-		return err;
-#ifdef CONFIG_AUDIO_QGKI
-	pr_debug("dsp consumed till %u total %llu bytes\n",
-		tstamp->byte_offset,
-		stream->runtime->total_bytes_transferred);
-#else
+	stream->ops->pointer(stream, tstamp);
 	pr_debug("dsp consumed till %d total %d bytes\n",
 		tstamp->byte_offset, tstamp->copied_total);
 	if (stream->direction == SND_COMPRESS_PLAYBACK)
 		stream->runtime->total_bytes_transferred = tstamp->copied_total;
 	else
 		stream->runtime->total_bytes_available = tstamp->copied_total;
-#endif
 	return 0;
 }
 
@@ -269,13 +260,8 @@ static int snd_compr_write_data(struct snd_compr_stream *stream,
 		      (app_pointer * runtime->buffer_size);
 
 	dstn = runtime->buffer + app_pointer;
-#ifdef CONFIG_AUDIO_QGKI
-	pr_debug("copying %zu at %lld\n",
-			count, app_pointer);
-#else
 	pr_debug("copying %ld at %lld\n",
 			(unsigned long)count, app_pointer);
-#endif
 	if (count < runtime->buffer_size - app_pointer) {
 		if (copy_from_user(dstn, buf, count))
 			return -EFAULT;
@@ -317,11 +303,7 @@ static ssize_t snd_compr_write(struct file *f, const char __user *buf,
 	}
 
 	avail = snd_compr_get_avail(stream);
-#ifdef CONFIG_AUDIO_QGKI
-	pr_debug("avail returned %zu\n", avail);
-#else
 	pr_debug("avail returned %ld\n", (unsigned long)avail);
-#endif
 	/* calculate how much we can write to buffer */
 	if (avail > count)
 		avail = count;
@@ -378,11 +360,7 @@ static ssize_t snd_compr_read(struct file *f, char __user *buf,
 	}
 
 	avail = snd_compr_get_avail(stream);
-#ifdef CONFIG_AUDIO_QGKI
-	pr_debug("avail returned %zu\n", avail);
-#else
 	pr_debug("avail returned %ld\n", (unsigned long)avail);
-#endif
 	/* calculate how much we can read from buffer */
 	if (avail > count)
 		avail = count;
@@ -440,11 +418,7 @@ static __poll_t snd_compr_poll(struct file *f, poll_table *wait)
 	poll_wait(f, &stream->runtime->sleep, wait);
 
 	avail = snd_compr_get_avail(stream);
-#ifdef CONFIG_AUDIO_QGKI
-	pr_debug("avail is %zu\n", avail);
-#else
 	pr_debug("avail is %ld\n", (unsigned long)avail);
-#endif
 	/* check if we have at least one fragment to fill */
 	switch (stream->runtime->state) {
 	case SNDRV_PCM_STATE_DRAINING:
@@ -678,14 +652,8 @@ snd_compr_set_metadata(struct snd_compr_stream *stream, unsigned long arg)
 static inline int
 snd_compr_tstamp(struct snd_compr_stream *stream, unsigned long arg)
 {
-	int ret;
-#ifdef AUDIO_QGKI
-	struct snd_compr_tstamp tstamp;
-
-	memset(&tstamp, 0, sizeof(tstamp));
-#else
 	struct snd_compr_tstamp tstamp = {0};
-#endif
+	int ret;
 
 	ret = snd_compr_update_tstamp(stream, &tstamp);
 	if (ret == 0)
@@ -754,6 +722,9 @@ static int snd_compr_stop(struct snd_compr_stream *stream)
 
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_STOP);
 	if (!retval) {
+		/* clear flags and stop any drain wait */
+		stream->partial_drain = false;
+		stream->metadata_set = false;
 		snd_compr_drain_notify(stream);
 		stream->runtime->total_bytes_available = 0;
 		stream->runtime->total_bytes_transferred = 0;
@@ -800,7 +771,6 @@ int snd_compr_stop_error(struct snd_compr_stream *stream,
 }
 EXPORT_SYMBOL_GPL(snd_compr_stop_error);
 
-#ifndef CONFIG_AUDIO_QGKI
 static int snd_compress_wait_for_drain(struct snd_compr_stream *stream)
 {
 	int ret;
@@ -835,7 +805,6 @@ static int snd_compress_wait_for_drain(struct snd_compr_stream *stream)
 
 	return ret;
 }
-#endif
 
 static int snd_compr_drain(struct snd_compr_stream *stream)
 {
@@ -854,7 +823,6 @@ static int snd_compr_drain(struct snd_compr_stream *stream)
 	}
 
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_DRAIN);
-#ifndef CONFIG_AUDIO_QGKI
 	if (retval) {
 		pr_debug("SND_COMPR_TRIGGER_DRAIN failed %d\n", retval);
 		wake_up(&stream->runtime->sleep);
@@ -862,13 +830,6 @@ static int snd_compr_drain(struct snd_compr_stream *stream)
 	}
 
 	return snd_compress_wait_for_drain(stream);
-#else
-	if (!retval) {
-		stream->runtime->state = SNDRV_PCM_STATE_DRAINING;
-		wake_up(&stream->runtime->sleep);
-	}
-	return retval;
-#endif
 }
 
 static int snd_compr_next_track(struct snd_compr_stream *stream)
@@ -921,8 +882,8 @@ static int snd_compr_partial_drain(struct snd_compr_stream *stream)
 	if (stream->next_track == false)
 		return -EPERM;
 
+	stream->partial_drain = true;
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_PARTIAL_DRAIN);
-#ifndef CONFIG_AUDIO_QGKI
 	if (retval) {
 		pr_debug("Partial drain returned failure\n");
 		wake_up(&stream->runtime->sleep);
@@ -931,74 +892,7 @@ static int snd_compr_partial_drain(struct snd_compr_stream *stream)
 
 	stream->next_track = false;
 	return snd_compress_wait_for_drain(stream);
-#else
-	stream->next_track = false;
-	return retval;
-#endif
 }
-
-#ifdef CONFIG_AUDIO_QGKI
-static int snd_compr_set_next_track_param(struct snd_compr_stream *stream,
-		unsigned long arg)
-{
-	union snd_codec_options codec_options;
-	int retval;
-
-	/* set next track params when stream is running or has been setup */
-	if (stream->runtime->state != SNDRV_PCM_STATE_SETUP &&
-			stream->runtime->state != SNDRV_PCM_STATE_RUNNING)
-		return -EPERM;
-
-	if (copy_from_user(&codec_options, (void __user *)arg,
-				sizeof(codec_options)))
-		return -EFAULT;
-
-	retval = stream->ops->set_next_track_param(stream, &codec_options);
-	return retval;
-}
-
-static int snd_compress_simple_ioctls(struct file *file,
-				struct snd_compr_stream *stream,
-				unsigned int cmd, unsigned long arg)
-{
-	int retval = -ENOTTY;
-
-	switch (_IOC_NR(cmd)) {
-	case _IOC_NR(SNDRV_COMPRESS_IOCTL_VERSION):
-		retval = put_user(SNDRV_COMPRESS_VERSION,
-				(int __user *)arg) ? -EFAULT : 0;
-		break;
-
-	case _IOC_NR(SNDRV_COMPRESS_GET_CAPS):
-		retval = snd_compr_get_caps(stream, arg);
-		break;
-
-#ifndef COMPR_CODEC_CAPS_OVERFLOW
-	case _IOC_NR(SNDRV_COMPRESS_GET_CODEC_CAPS):
-		retval = snd_compr_get_codec_caps(stream, arg);
-		break;
-#endif
-
-	case _IOC_NR(SNDRV_COMPRESS_TSTAMP):
-		retval = snd_compr_tstamp(stream, arg);
-		break;
-
-	case _IOC_NR(SNDRV_COMPRESS_AVAIL):
-		retval = snd_compr_ioctl_avail(stream, arg);
-		break;
-
-	case _IOC_NR(SNDRV_COMPRESS_DRAIN):
-		retval = snd_compr_drain(stream);
-		break;
-
-	case _IOC_NR(SNDRV_COMPRESS_PARTIAL_DRAIN):
-		retval = snd_compr_partial_drain(stream);
-		break;
-	}
-
-	return retval;
-}
-#endif
 
 static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -1013,7 +907,6 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	mutex_lock(&stream->device->lock);
 	switch (_IOC_NR(cmd)) {
-#ifndef CONFIG_AUDIO_QGKI
 	case _IOC_NR(SNDRV_COMPRESS_IOCTL_VERSION):
 		retval = put_user(SNDRV_COMPRESS_VERSION,
 				(int __user *)arg) ? -EFAULT : 0;
@@ -1025,7 +918,6 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case _IOC_NR(SNDRV_COMPRESS_GET_CODEC_CAPS):
 		retval = snd_compr_get_codec_caps(stream, arg);
 		break;
-#endif
 #endif
 	case _IOC_NR(SNDRV_COMPRESS_SET_PARAMS):
 		retval = snd_compr_set_params(stream, arg);
@@ -1039,14 +931,12 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case _IOC_NR(SNDRV_COMPRESS_GET_METADATA):
 		retval = snd_compr_get_metadata(stream, arg);
 		break;
-#ifndef CONFIG_AUDIO_QGKI
 	case _IOC_NR(SNDRV_COMPRESS_TSTAMP):
 		retval = snd_compr_tstamp(stream, arg);
 		break;
 	case _IOC_NR(SNDRV_COMPRESS_AVAIL):
 		retval = snd_compr_ioctl_avail(stream, arg);
 		break;
-#endif
 	case _IOC_NR(SNDRV_COMPRESS_PAUSE):
 		retval = snd_compr_pause(stream);
 		break;
@@ -1059,25 +949,16 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case _IOC_NR(SNDRV_COMPRESS_STOP):
 		retval = snd_compr_stop(stream);
 		break;
-#ifndef CONFIG_AUDIO_QGKI
 	case _IOC_NR(SNDRV_COMPRESS_DRAIN):
 		retval = snd_compr_drain(stream);
 		break;
 	case _IOC_NR(SNDRV_COMPRESS_PARTIAL_DRAIN):
 		retval = snd_compr_partial_drain(stream);
 		break;
-#endif
 	case _IOC_NR(SNDRV_COMPRESS_NEXT_TRACK):
 		retval = snd_compr_next_track(stream);
 		break;
-#ifdef CONFIG_AUDIO_QGKI
-	case _IOC_NR(SNDRV_COMPRESS_SET_NEXT_TRACK_PARAM):
-		retval = snd_compr_set_next_track_param(stream, arg);
-		break;
-	default:
-		mutex_unlock(&stream->device->lock);
-		return snd_compress_simple_ioctls(f, stream, cmd, arg);
-#endif
+
 	}
 	mutex_unlock(&stream->device->lock);
 	return retval;

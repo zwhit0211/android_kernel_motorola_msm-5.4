@@ -23,6 +23,8 @@
 #define VMALLOC_START		(MODULES_END)
 #define VMALLOC_END		(- PUD_SIZE - VMEMMAP_SIZE - SZ_64K)
 
+#define vmemmap			((struct page *)VMEMMAP_START - (memstart_addr >> PAGE_SHIFT))
+
 #define FIRST_USER_ADDRESS	0UL
 
 #ifndef __ASSEMBLY__
@@ -32,8 +34,6 @@
 #include <linux/mmdebug.h>
 #include <linux/mm_types.h>
 #include <linux/sched.h>
-
-extern struct page *vmemmap;
 
 extern void __pte_error(const char *file, int line, unsigned long val);
 extern void __pmd_error(const char *file, int line, unsigned long val);
@@ -511,11 +511,6 @@ static inline phys_addr_t pmd_page_paddr(pmd_t pmd)
 
 static inline void pte_unmap(pte_t *pte) { }
 
-static inline unsigned long pmd_page_vaddr(pmd_t pmd)
-{
-	return (unsigned long) __va(pmd_page_paddr(pmd));
-}
-
 /* Find an entry in the third-level page table. */
 #define pte_index(addr)		(((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
 
@@ -573,11 +568,6 @@ static inline void pud_clear(pud_t *pudp)
 static inline phys_addr_t pud_page_paddr(pud_t pud)
 {
 	return __pud_to_phys(pud);
-}
-
-static inline unsigned long pud_page_vaddr(pud_t pud)
-{
-	return (unsigned long) __va(pud_page_paddr(pud));
 }
 
 /* Find an entry in the second-level page table. */
@@ -638,11 +628,6 @@ static inline phys_addr_t pgd_page_paddr(pgd_t pgd)
 	return __pgd_to_phys(pgd);
 }
 
-static inline unsigned long pgd_page_vaddr(pgd_t pgd)
-{
-	return (unsigned long) __va(pgd_page_paddr(pgd));
-}
-
 /* Find an entry in the frst-level page table. */
 #define pud_index(addr)		(((addr) >> PUD_SHIFT) & (PTRS_PER_PUD - 1))
 
@@ -694,6 +679,12 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	if (pte_hw_dirty(pte))
 		pte = pte_mkdirty(pte);
 	pte_val(pte) = (pte_val(pte) & ~mask) | (pgprot_val(newprot) & mask);
+	/*
+	 * If we end up clearing hw dirtiness for a sw-dirty PTE, set hardware
+	 * dirtiness again.
+	 */
+	if (pte_sw_dirty(pte))
+		pte = pte_mkdirty(pte);
 	return pte;
 }
 

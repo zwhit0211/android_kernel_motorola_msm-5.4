@@ -394,7 +394,6 @@ static struct dyn_event_operations synth_event_ops = {
 	.match = synth_event_match,
 };
 
-#ifndef CONFIG_KPROBES_DEBUG
 struct synth_field {
 	char *type;
 	char *name;
@@ -414,7 +413,6 @@ struct synth_event {
 	struct trace_event_call			call;
 	struct tracepoint			*tp;
 };
-#endif
 
 static bool is_synth_event(struct dyn_event *ev)
 {
@@ -969,11 +967,8 @@ static notrace void trace_event_raw_event_synth(void *__data,
 			n_u64++;
 		}
 	}
-#ifdef CONFIG_CORESIGHT_QGKI
-	trace_event_buffer_commit(&fbuffer, sizeof(*entry) + fields_size);
-#else
+
 	trace_event_buffer_commit(&fbuffer);
-#endif
 out:
 	ring_buffer_nest_end(buffer);
 }
@@ -1176,11 +1171,7 @@ static inline void trace_synth(struct synth_event *event, u64 *var_ref_vals,
 	}
 }
 
-#ifdef CONFIG_KPROBES_DEBUG
-struct synth_event *find_synth_event(const char *name)
-#else
 static struct synth_event *find_synth_event(const char *name)
-#endif
 {
 	struct dyn_event *pos;
 	struct synth_event *event;
@@ -1195,9 +1186,6 @@ static struct synth_event *find_synth_event(const char *name)
 
 	return NULL;
 }
-#ifdef CONFIG_KPROBES_DEBUG
-EXPORT_SYMBOL(find_synth_event);
-#endif
 
 static int register_synth_event(struct synth_event *event)
 {
@@ -2007,6 +1995,9 @@ static const char *hist_field_name(struct hist_field *field,
 				   unsigned int level)
 {
 	const char *field_name = "";
+
+	if (WARN_ON_ONCE(!field))
+		return field_name;
 
 	if (level > 1)
 		return field_name;
@@ -4650,7 +4641,7 @@ static int create_var_field(struct hist_trigger_data *hist_data,
 
 	ret = __create_val_field(hist_data, val_idx, file, var_name, expr_str, flags);
 
-	if (!ret && hist_data->fields[val_idx]->flags & HIST_FIELD_FL_STRING)
+	if (hist_data->fields[val_idx]->flags & HIST_FIELD_FL_STRING)
 		hist_data->fields[val_idx]->var_str_idx = hist_data->n_var_str++;
 
 	return ret;
@@ -6432,12 +6423,15 @@ static int event_hist_trigger_func(struct event_command *cmd_ops,
 	if (get_named_trigger_data(trigger_data))
 		goto enable;
 
-	if (has_hist_vars(hist_data))
-		save_hist_vars(hist_data);
-
 	ret = create_actions(hist_data);
 	if (ret)
 		goto out_unreg;
+
+	if (has_hist_vars(hist_data) || hist_data->n_var_refs) {
+		ret = save_hist_vars(hist_data);
+		if (ret)
+			goto out_unreg;
+	}
 
 	ret = tracing_map_init(hist_data->map);
 	if (ret)

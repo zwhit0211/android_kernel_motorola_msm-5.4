@@ -15,20 +15,6 @@ config VALIDATE_FS_PARSER
 	  Enable this to perform validation of the parameter description for a
 	  filesystem when it is registered.
 
-config FS_EPOLL_WAKEUP_DEBUG
-	bool "debug eventpoll wakeup source"
-	default n
-	help
-	  This option enables printing thread ID and name of eventpoll wakeup source
-	  while waking up system for debug purpose. Keep it off if not sure.
-
-config FELICA_MOUNT_BLOCK
-	bool "Block mount sdcard to system path"
-	default n
-	help
-	  Mounts on "/system", "/system_ext", "/product", "/vendor" should be blocked
-	  in the root environment.
-
 if BLOCK
 
 config FS_IOMAP
@@ -135,7 +121,6 @@ source "fs/quota/Kconfig"
 source "fs/autofs/Kconfig"
 source "fs/fuse/Kconfig"
 source "fs/overlayfs/Kconfig"
-source "fs/incfs/Kconfig"
 
 menu "Caches"
 
@@ -154,10 +139,9 @@ endmenu
 endif # BLOCK
 
 if BLOCK
-menu "DOS/FAT/EXFAT/NT Filesystems"
+menu "DOS/FAT/NT Filesystems"
 
 source "fs/fat/Kconfig"
-source "fs/exfat/Kconfig"
 source "fs/ntfs/Kconfig"
 
 endmenu
@@ -308,6 +292,7 @@ config GRACE_PERIOD
 config LOCKD
 	tristate
 	depends on FILE_LOCKING
+	select CRC32
 	select GRACE_PERIOD
 
 config LOCKD_V4

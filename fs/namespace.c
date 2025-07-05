@@ -30,7 +30,6 @@
 #include <uapi/linux/mount.h>
 #include <linux/fs_context.h>
 #include <linux/shmem_fs.h>
-#include <linux/types.h>
 
 #include "pnode.h"
 #include "internal.h"
@@ -199,7 +198,6 @@ static struct mount *alloc_vfsmnt(const char *name)
 		mnt->mnt_count = 1;
 		mnt->mnt_writers = 0;
 #endif
-		mnt->mnt.data = NULL;
 
 		INIT_HLIST_NODE(&mnt->mnt_hash);
 		INIT_LIST_HEAD(&mnt->mnt_child);
@@ -549,7 +547,6 @@ int sb_prepare_remount_readonly(struct super_block *sb)
 
 static void free_vfsmnt(struct mount *mnt)
 {
-	kfree(mnt->mnt.data);
 	kfree_const(mnt->mnt_devname);
 #ifdef CONFIG_SMP
 	free_percpu(mnt->mnt_pcp);
@@ -572,15 +569,11 @@ int __legitimize_mnt(struct vfsmount *bastard, unsigned seq)
 		return 0;
 	mnt = real_mount(bastard);
 	mnt_add_count(mnt, 1);
-	smp_mb();			// see mntput_no_expire()
+	smp_mb();		// see mntput_no_expire() and do_umount()
 	if (likely(!read_seqretry(&mount_lock, seq)))
 		return 0;
-	if (bastard->mnt_flags & MNT_SYNC_UMOUNT) {
-		mnt_add_count(mnt, -1);
-		return 1;
-	}
 	lock_mount_hash();
-	if (unlikely(bastard->mnt_flags & MNT_DOOMED)) {
+	if (unlikely(bastard->mnt_flags & (MNT_SYNC_UMOUNT | MNT_DOOMED))) {
 		mnt_add_count(mnt, -1);
 		unlock_mount_hash();
 		return 1;
@@ -936,26 +929,14 @@ static struct mount *skip_mnt_tree(struct mount *p)
 struct vfsmount *vfs_create_mount(struct fs_context *fc)
 {
 	struct mount *mnt;
-	struct super_block *sb;
 
 	if (!fc->root)
 		return ERR_PTR(-EINVAL);
-	sb = fc->root->d_sb;
 
 	mnt = alloc_vfsmnt(fc->source ?: "none");
 	if (!mnt)
 		return ERR_PTR(-ENOMEM);
 
-	if (fc->fs_type->alloc_mnt_data) {
-		mnt->mnt.data = fc->fs_type->alloc_mnt_data();
-		if (!mnt->mnt.data) {
-			mnt_free_id(mnt);
-			free_vfsmnt(mnt);
-			return ERR_PTR(-ENOMEM);
-		}
-		if (sb->s_op->update_mnt_data)
-			sb->s_op->update_mnt_data(mnt->mnt.data, fc);
-	}
 	if (fc->sb_flags & SB_KERNMOUNT)
 		mnt->mnt.mnt_flags = MNT_INTERNAL;
 
@@ -1038,14 +1019,6 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 	mnt = alloc_vfsmnt(old->mnt_devname);
 	if (!mnt)
 		return ERR_PTR(-ENOMEM);
-
-	if (sb->s_op->clone_mnt_data) {
-		mnt->mnt.data = sb->s_op->clone_mnt_data(old->mnt.data);
-		if (!mnt->mnt.data) {
-			err = -ENOMEM;
-			goto out_free;
-		}
-	}
 
 	if (flag & (CL_SLAVE | CL_PRIVATE | CL_SHARED_TO_SLAVE))
 		mnt->mnt_group_id = 0; /* not a peer of original */
@@ -1611,6 +1584,7 @@ static int do_umount(struct mount *mnt, int flags)
 			umount_tree(mnt, UMOUNT_PROPAGATE);
 		retval = 0;
 	} else {
+		smp_mb(); // paired with __legitimize_mnt()
 		shrink_submounts(mnt);
 		retval = -EBUSY;
 		if (!propagate_mount_busy(mnt, 2)) {
@@ -2272,6 +2246,10 @@ static int do_change_type(struct path *path, int ms_flags)
 		return -EINVAL;
 
 	namespace_lock();
+	if (!check_mnt(mnt)) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
 	if (type == MS_SHARED) {
 		err = invent_group_ids(mnt, recurse);
 		if (err)
@@ -2515,20 +2493,27 @@ static void mnt_warn_timestamp_expiry(struct path *mountpoint, struct vfsmount *
 	struct super_block *sb = mnt->mnt_sb;
 
 	if (!__mnt_is_readonly(mnt) &&
+	   (!(sb->s_iflags & SB_I_TS_EXPIRY_WARNED)) &&
 	   (ktime_get_real_seconds() + TIME_UPTIME_SEC_MAX > sb->s_time_max)) {
-		char *buf = (char *)__get_free_page(GFP_KERNEL);
-		char *mntpath = buf ? d_path(mountpoint, buf, PAGE_SIZE) : ERR_PTR(-ENOMEM);
-		struct tm tm;
+		char *buf, *mntpath;
 
-		time64_to_tm(sb->s_time_max, 0, &tm);
+		buf = (char *)__get_free_page(GFP_KERNEL);
+		if (buf)
+			mntpath = d_path(mountpoint, buf, PAGE_SIZE);
+		else
+			mntpath = ERR_PTR(-ENOMEM);
+		if (IS_ERR(mntpath))
+			mntpath = "(unknown)";
 
-		pr_warn("%s filesystem being %s at %s supports timestamps until %04ld (0x%llx)\n",
+		pr_warn("%s filesystem being %s at %s supports timestamps until %ptTd (0x%llx)\n",
 			sb->s_type->name,
 			is_mounted(mnt) ? "remounted" : "mounted",
-			mntpath,
-			tm.tm_year+1900, (unsigned long long)sb->s_time_max);
+			mntpath, &sb->s_time_max,
+			(unsigned long long)sb->s_time_max);
 
-		free_page((unsigned long)buf);
+		sb->s_iflags |= SB_I_TS_EXPIRY_WARNED;
+		if (buf)
+			free_page((unsigned long)buf);
 	}
 }
 
@@ -2595,15 +2580,7 @@ static int do_remount(struct path *path, int ms_flags, int sb_flags,
 		err = -EPERM;
 		if (ns_capable(sb->s_user_ns, CAP_SYS_ADMIN)) {
 			err = reconfigure_super(fc);
-			if (!err && sb->s_op->update_mnt_data) {
-				sb->s_op->update_mnt_data(mnt->mnt.data, fc);
-				set_mount_attributes(mnt, mnt_flags);
-				namespace_lock();
-				lock_mount_hash();
-				propagate_remount(mnt);
-				unlock_mount_hash();
-				namespace_unlock();
-			} else if (!err)
+			if (!err)
 				set_mount_attributes(mnt, mnt_flags);
 		}
 		up_write(&sb->s_umount);
@@ -3096,68 +3073,6 @@ char *copy_mount_string(const void __user *data)
 	return data ? strndup_user(data, PATH_MAX) : NULL;
 }
 
-#ifdef CONFIG_FELICA_MOUNT_BLOCK
-/*
- * Felica requirement:
- * Mounts on "/system", "/system_ext", "/product", "/vendor" should be blocked
- * e.g.
- * adb root
- * adb shell mount -r -w sdcard /system
- * adb shell mount -r -w sdcard /system_ext
- * adb shell mount -r -w sdcard /product
- * adb shell mount -r -w sdcard /vendor
- * adb shell mount -r -w /dev/block/vold/public:179,1 /system
- * adb shell mount -r -w /dev/block/vold/public:179,1 /system_ext
- * adb shell mount -r -w /dev/block/vold/public:179,1 /product
- * adb shell mount -r -w /dev/block/vold/public:179,1 /vendor
-*/
-static bool mount_block_check(unsigned long flags, struct path *path)
-{
-	int i;
-	char *buf, *pathname;
-	u32 secid, su_secid, init_secid;
-	const char *su_secctx = "u:r:su:s0";
-	const char *init_secctx = "u:r:init:s0";
-	const char *blocklist[] = {"/system", "/system_ext", "/product", "/vendor", "/odm", "/oem"};
-	int len = ARRAY_SIZE(blocklist);
-	bool ret = false;
-
-	/* "adb remount" is allowed */
-	if (flags & MS_REMOUNT)
-		return ret;
-
-	buf = (char *)__get_free_page(GFP_KERNEL);
-	if (!buf)
-		return ret;
-
-	pathname = d_path(path, buf, PAGE_SIZE);
-	if (IS_ERR(pathname))
-		goto out_putname;
-
-	/* Check mount point */
-	for (i = 0; i < len; i++) {
-		if (!strncmp(pathname, blocklist[i], strlen(blocklist[i])))
-			break;
-	}
-	if (i == len)
-		goto out_putname;
-
-	security_secctx_to_secid(su_secctx, strlen(su_secctx), &su_secid);
-	security_secctx_to_secid(init_secctx, strlen(init_secctx), &init_secid);
-	security_task_getsecid(current, &secid);
-
-	/* "su" should be blocked, the secid of su equals init at init first stage*/
-	if ((secid != init_secid) && (secid == su_secid)) {
-		pr_warn("Mount on %s is not allowed with %d\n", pathname, secid);
-		ret = true;
-	}
-
-out_putname:
-	free_page((unsigned long)buf);
-	return ret;
-}
-#endif
-
 /*
  * Flags is a 32-bit value that allows up to 31 non-fs dependent flags to
  * be given to the mount() call (ie: read-only, no-dev, no-suid etc).
@@ -3201,10 +3116,6 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 		retval = -EPERM;
 	if (!retval && (flags & SB_MANDLOCK) && !may_mandlock())
 		retval = -EPERM;
-#ifdef CONFIG_FELICA_MOUNT_BLOCK
-	if (mount_block_check(flags, &path))
-		retval = -EPERM;
-#endif
 	if (retval)
 		goto dput_out;
 

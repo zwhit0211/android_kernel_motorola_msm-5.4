@@ -20,8 +20,6 @@
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/consumer.h>
 #include <linux/regulator/coupler.h>
@@ -54,9 +52,6 @@ static LIST_HEAD(regulator_ena_gpio_list);
 static LIST_HEAD(regulator_supply_alias_list);
 static LIST_HEAD(regulator_coupler_list);
 static bool has_full_constraints;
-#ifdef CONFIG_DEBUG_FS
-static bool debug_suspend;
-#endif
 
 static struct dentry *debugfs_root;
 
@@ -222,6 +217,78 @@ void regulator_unlock(struct regulator_dev *rdev)
 }
 EXPORT_SYMBOL_GPL(regulator_unlock);
 
+/**
+ * regulator_lock_two - lock two regulators
+ * @rdev1:		first regulator
+ * @rdev2:		second regulator
+ * @ww_ctx:		w/w mutex acquire context
+ *
+ * Locks both rdevs using the regulator_ww_class.
+ */
+static void regulator_lock_two(struct regulator_dev *rdev1,
+			       struct regulator_dev *rdev2,
+			       struct ww_acquire_ctx *ww_ctx)
+{
+	struct regulator_dev *tmp;
+	int ret;
+
+	ww_acquire_init(ww_ctx, &regulator_ww_class);
+
+	/* Try to just grab both of them */
+	ret = regulator_lock_nested(rdev1, ww_ctx);
+	WARN_ON(ret);
+	ret = regulator_lock_nested(rdev2, ww_ctx);
+	if (ret != -EDEADLOCK) {
+		WARN_ON(ret);
+		goto exit;
+	}
+
+	while (true) {
+		/*
+		 * Start of loop: rdev1 was locked and rdev2 was contended.
+		 * Need to unlock rdev1, slowly lock rdev2, then try rdev1
+		 * again.
+		 */
+		regulator_unlock(rdev1);
+
+		ww_mutex_lock_slow(&rdev2->mutex, ww_ctx);
+		rdev2->ref_cnt++;
+		rdev2->mutex_owner = current;
+		ret = regulator_lock_nested(rdev1, ww_ctx);
+
+		if (ret == -EDEADLOCK) {
+			/* More contention; swap which needs to be slow */
+			tmp = rdev1;
+			rdev1 = rdev2;
+			rdev2 = tmp;
+		} else {
+			WARN_ON(ret);
+			break;
+		}
+	}
+
+exit:
+	ww_acquire_done(ww_ctx);
+}
+
+/**
+ * regulator_unlock_two - unlock two regulators
+ * @rdev1:		first regulator
+ * @rdev2:		second regulator
+ * @ww_ctx:		w/w mutex acquire context
+ *
+ * The inverse of regulator_lock_two().
+ */
+
+static void regulator_unlock_two(struct regulator_dev *rdev1,
+				 struct regulator_dev *rdev2,
+				 struct ww_acquire_ctx *ww_ctx)
+{
+	regulator_unlock(rdev2);
+	regulator_unlock(rdev1);
+	ww_acquire_fini(ww_ctx);
+}
+
 static bool regulator_supply_is_couple(struct regulator_dev *rdev)
 {
 	struct regulator_dev *c_rdev;
@@ -349,6 +416,7 @@ static void regulator_lock_dependent(struct regulator_dev *rdev,
 			ww_mutex_lock_slow(&new_contended_rdev->mutex, ww_ctx);
 			old_contended_rdev = new_contended_rdev;
 			old_contended_rdev->ref_cnt++;
+			old_contended_rdev->mutex_owner = current;
 		}
 
 		err = regulator_lock_recursive(rdev,
@@ -443,15 +511,6 @@ int regulator_check_voltage(struct regulator_dev *rdev,
 		return -EPERM;
 	}
 
-	/* check if requested voltage range actually overlaps the constraints */
-	if (*max_uV < rdev->constraints->min_uV ||
-	    *min_uV > rdev->constraints->max_uV) {
-		rdev_err(rdev, "requested voltage range [%d, %d] does not fit within constraints: [%d, %d]\n",
-			*min_uV, *max_uV, rdev->constraints->min_uV,
-			rdev->constraints->max_uV);
-		return -EINVAL;
-	}
-
 	if (*max_uV > rdev->constraints->max_uV)
 		*max_uV = rdev->constraints->max_uV;
 	if (*min_uV < rdev->constraints->min_uV)
@@ -481,8 +540,6 @@ int regulator_check_consumers(struct regulator_dev *rdev,
 {
 	struct regulator *regulator;
 	struct regulator_voltage *voltage;
-	int init_min_uV = *min_uV;
-	int init_max_uV = *max_uV;
 
 	list_for_each_entry(regulator, &rdev->consumer_list, list) {
 		voltage = &regulator->voltage[state];
@@ -492,12 +549,6 @@ int regulator_check_consumers(struct regulator_dev *rdev,
 		 */
 		if (!voltage->min_uV && !voltage->max_uV)
 			continue;
-
-		if (init_max_uV < voltage->min_uV
-		    || init_min_uV > voltage->max_uV)
-			rdev_err(rdev, "requested voltage range [%d, %d] does not fit within previously voted range: [%d, %d]\n",
-				init_min_uV, init_max_uV, voltage->min_uV,
-				voltage->max_uV);
 
 		if (*max_uV > voltage->max_uV)
 			*max_uV = voltage->max_uV;
@@ -1440,8 +1491,8 @@ static int set_machine_constraints(struct regulator_dev *rdev)
 
 /**
  * set_supply - set regulator supply regulator
- * @rdev: regulator name
- * @supply_rdev: supply regulator name
+ * @rdev: regulator (locked)
+ * @supply_rdev: supply regulator (locked))
  *
  * Called by platform initialisation code to set the supply regulator for this
  * regulator. This ensures that a regulators supply will also be enabled by the
@@ -1613,6 +1664,8 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 	struct regulator *regulator;
 	int err = 0;
 
+	lockdep_assert_held_once(&rdev->mutex.base);
+
 	if (dev) {
 		char buf[REG_STR_SIZE];
 		int size;
@@ -1640,9 +1693,7 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 	regulator->rdev = rdev;
 	regulator->supply_name = supply_name;
 
-	regulator_lock(rdev);
 	list_add(&regulator->list, &rdev->consumer_list);
-	regulator_unlock(rdev);
 
 	if (dev) {
 		regulator->dev = dev;
@@ -1657,20 +1708,23 @@ static struct regulator *create_regulator(struct regulator_dev *rdev,
 		}
 	}
 
-	if (err != -EEXIST)
+	if (err != -EEXIST) {
 		regulator->debugfs = debugfs_create_dir(supply_name, rdev->debugfs);
-	if (!regulator->debugfs) {
-		rdev_dbg(rdev, "Failed to create debugfs directory\n");
-	} else {
+		if (IS_ERR(regulator->debugfs)) {
+			rdev_dbg(rdev, "Failed to create debugfs directory\n");
+			regulator->debugfs = NULL;
+		}
+	}
+
+	if (regulator->debugfs) {
 		debugfs_create_u32("uA_load", 0444, regulator->debugfs,
 				   &regulator->uA_load);
 		debugfs_create_u32("min_uV", 0444, regulator->debugfs,
 				   &regulator->voltage[PM_SUSPEND_ON].min_uV);
 		debugfs_create_u32("max_uV", 0444, regulator->debugfs,
 				   &regulator->voltage[PM_SUSPEND_ON].max_uV);
-		debugfs_create_file("constraint_flags", 0444,
-				    regulator->debugfs, regulator,
-				    &constraint_flags_fops);
+		debugfs_create_file("constraint_flags", 0444, regulator->debugfs,
+				    regulator, &constraint_flags_fops);
 	}
 
 	/*
@@ -1808,6 +1862,7 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
 {
 	struct regulator_dev *r;
 	struct device *dev = rdev->dev.parent;
+	struct ww_acquire_ctx ww_ctx;
 	int ret = 0;
 
 	/* No supply to resolve? */
@@ -1874,23 +1929,23 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
 	 * between rdev->supply null check and setting rdev->supply in
 	 * set_supply() from concurrent tasks.
 	 */
-	regulator_lock(rdev);
+	regulator_lock_two(rdev, r, &ww_ctx);
 
 	/* Supply just resolved by a concurrent task? */
 	if (rdev->supply) {
-		regulator_unlock(rdev);
+		regulator_unlock_two(rdev, r, &ww_ctx);
 		put_device(&r->dev);
 		goto out;
 	}
 
 	ret = set_supply(rdev, r);
 	if (ret < 0) {
-		regulator_unlock(rdev);
+		regulator_unlock_two(rdev, r, &ww_ctx);
 		put_device(&r->dev);
 		goto out;
 	}
 
-	regulator_unlock(rdev);
+	regulator_unlock_two(rdev, r, &ww_ctx);
 
 	/*
 	 * In set_machine_constraints() we may have turned this regulator on
@@ -1917,7 +1972,6 @@ struct regulator *_regulator_get(struct device *dev, const char *id,
 	struct regulator_dev *rdev;
 	struct regulator *regulator;
 	const char *devname = dev ? dev_name(dev) : "deviceless";
-	struct device_link *link;
 	int ret;
 
 	if (get_type >= MAX_GET_TYPE) {
@@ -2006,7 +2060,9 @@ struct regulator *_regulator_get(struct device *dev, const char *id,
 		return regulator;
 	}
 
+	regulator_lock(rdev);
 	regulator = create_regulator(rdev, dev, id);
+	regulator_unlock(rdev);
 	if (regulator == NULL) {
 		regulator = ERR_PTR(-ENOMEM);
 		module_put(rdev->owner);
@@ -2028,9 +2084,7 @@ struct regulator *_regulator_get(struct device *dev, const char *id,
 		}
 	}
 
-	link = device_link_add(dev, &rdev->dev, DL_FLAG_STATELESS);
-	if (!IS_ERR_OR_NULL(link))
-		regulator->device_link = true;
+	device_link_add(dev, &rdev->dev, DL_FLAG_STATELESS);
 
 	return regulator;
 }
@@ -2125,8 +2179,7 @@ static void _regulator_put(struct regulator *regulator)
 	debugfs_remove_recursive(regulator->debugfs);
 
 	if (regulator->dev) {
-		if (regulator->device_link)
-			device_link_remove(regulator->dev, &rdev->dev);
+		device_link_remove(regulator->dev, &rdev->dev);
 
 		/* remove any sysfs entries */
 		sysfs_remove_link(&rdev->dev.kobj, regulator->supply_name);
@@ -2610,7 +2663,8 @@ static int _regulator_enable(struct regulator *regulator)
 		/* Fallthrough on positive return values - already enabled */
 	}
 
-	rdev->use_count++;
+	if (regulator->enable_count == 1)
+		rdev->use_count++;
 
 	return 0;
 
@@ -2688,37 +2742,40 @@ static int _regulator_disable(struct regulator *regulator)
 
 	lockdep_assert_held_once(&rdev->mutex.base);
 
-	if (WARN(rdev->use_count <= 0,
+	if (WARN(regulator->enable_count == 0,
 		 "unbalanced disables for %s\n", rdev_get_name(rdev)))
 		return -EIO;
 
-	/* are we the last user and permitted to disable ? */
-	if (rdev->use_count == 1 &&
-	    (rdev->constraints && !rdev->constraints->always_on)) {
+	if (regulator->enable_count == 1) {
+	/* disabling last enable_count from this regulator */
+		/* are we the last user and permitted to disable ? */
+		if (rdev->use_count == 1 &&
+		    (rdev->constraints && !rdev->constraints->always_on)) {
 
-		/* we are last user */
-		if (regulator_ops_is_valid(rdev, REGULATOR_CHANGE_STATUS)) {
-			ret = _notifier_call_chain(rdev,
-						   REGULATOR_EVENT_PRE_DISABLE,
-						   NULL);
-			if (ret & NOTIFY_STOP_MASK)
-				return -EINVAL;
+			/* we are last user */
+			if (regulator_ops_is_valid(rdev, REGULATOR_CHANGE_STATUS)) {
+				ret = _notifier_call_chain(rdev,
+							   REGULATOR_EVENT_PRE_DISABLE,
+							   NULL);
+				if (ret & NOTIFY_STOP_MASK)
+					return -EINVAL;
 
-			ret = _regulator_do_disable(rdev);
-			if (ret < 0) {
-				rdev_err(rdev, "failed to disable\n");
-				_notifier_call_chain(rdev,
-						REGULATOR_EVENT_ABORT_DISABLE,
+				ret = _regulator_do_disable(rdev);
+				if (ret < 0) {
+					rdev_err(rdev, "failed to disable\n");
+					_notifier_call_chain(rdev,
+							REGULATOR_EVENT_ABORT_DISABLE,
+							NULL);
+					return ret;
+				}
+				_notifier_call_chain(rdev, REGULATOR_EVENT_DISABLE,
 						NULL);
-				return ret;
 			}
-			_notifier_call_chain(rdev, REGULATOR_EVENT_DISABLE,
-					NULL);
-		}
 
-		rdev->use_count = 0;
-	} else if (rdev->use_count > 1) {
-		rdev->use_count--;
+			rdev->use_count = 0;
+		} else if (rdev->use_count > 1) {
+			rdev->use_count--;
+		}
 	}
 
 	if (ret == 0)
@@ -3017,6 +3074,7 @@ struct regmap *regulator_get_regmap(struct regulator *regulator)
 
 	return map ? map : ERR_PTR(-EOPNOTSUPP);
 }
+EXPORT_SYMBOL_GPL(regulator_get_regmap);
 
 /**
  * regulator_get_hardware_vsel_register - get the HW voltage selector register
@@ -4389,18 +4447,6 @@ int regulator_set_load(struct regulator *regulator, int uA_load)
 }
 EXPORT_SYMBOL_GPL(regulator_set_load);
 
-#ifdef CONFIG_REGULATOR_QTI_DEBUG
-static inline int regulator_open_offset(struct regulator_dev *rdev)
-{
-	return rdev->open_offset;
-}
-#else
-static inline int regulator_open_offset(struct regulator_dev *rdev)
-{
-	return 0;
-}
-#endif
-
 /**
  * regulator_allow_bypass - allow the regulator to go into bypass mode
  *
@@ -4428,8 +4474,7 @@ int regulator_allow_bypass(struct regulator *regulator, bool enable)
 	if (enable && !regulator->bypass) {
 		rdev->bypass_count++;
 
-		if (rdev->bypass_count == rdev->open_count -
-		    regulator_open_offset(rdev)) {
+		if (rdev->bypass_count == rdev->open_count) {
 			ret = rdev->desc->ops->set_bypass(rdev, enable);
 			if (ret != 0)
 				rdev->bypass_count--;
@@ -4438,8 +4483,7 @@ int regulator_allow_bypass(struct regulator *regulator, bool enable)
 	} else if (!enable && regulator->bypass) {
 		rdev->bypass_count--;
 
-		if (rdev->bypass_count != rdev->open_count -
-		    regulator_open_offset(rdev)) {
+		if (rdev->bypass_count != rdev->open_count) {
 			ret = rdev->desc->ops->set_bypass(rdev, enable);
 			if (ret != 0)
 				rdev->bypass_count++;
@@ -4856,378 +4900,6 @@ static void regulator_dev_release(struct device *dev)
 	kfree(rdev);
 }
 
-#ifdef CONFIG_REGULATOR_QTI_DEBUG
-
-static struct regulator *reg_debug_get_consumer(struct regulator_dev *rdev)
-{
-	struct regulator *regulator;
-
-	if (rdev->debug_consumer)
-		return rdev->debug_consumer;
-
-	regulator = regulator_get(NULL, rdev_get_name(rdev));
-	if (IS_ERR(regulator)) {
-		rdev_dbg(rdev, "debug consumer regulator get failed, ret=%ld\n",
-			PTR_ERR(regulator));
-		return NULL;
-	}
-	rdev->debug_consumer = regulator;
-	if (regulator)
-		rdev->open_offset = 1;
-
-	return regulator;
-}
-
-static int reg_debug_enable_set(void *data, u64 val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	int ret;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	if (val) {
-		ret = regulator_enable(regulator);
-		if (ret)
-			rdev_err(rdev, "enable failed, ret=%d\n", ret);
-	} else {
-		ret = regulator_disable(regulator);
-		if (ret)
-			rdev_err(rdev, "disable failed, ret=%d\n", ret);
-	}
-
-	return ret;
-}
-
-static int reg_debug_enable_get(void *data, u64 *val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	*val = regulator_is_enabled(regulator);
-
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(reg_enable_fops, reg_debug_enable_get,
-			reg_debug_enable_set, "%llu\n");
-
-static int reg_debug_bypass_enable_get(void *data, u64 *val)
-{
-	struct regulator_dev *rdev = data;
-	struct ww_acquire_ctx ww_ctx;
-	bool enable = false;
-	int ret = 0;
-
-	regulator_lock_dependent(rdev, &ww_ctx);
-	if (rdev->desc->ops->get_bypass) {
-		ret = rdev->desc->ops->get_bypass(rdev, &enable);
-		if (ret)
-			rdev_err(rdev, "get_bypass() failed, ret=%d\n", ret);
-	} else {
-		enable = (rdev->bypass_count == rdev->open_count
-			  - rdev->open_offset);
-	}
-	regulator_unlock_dependent(rdev, &ww_ctx);
-
-	*val = enable;
-
-	return ret;
-}
-
-static int reg_debug_bypass_enable_set(void *data, u64 val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	struct ww_acquire_ctx ww_ctx;
-	int ret;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	regulator_lock_dependent(rdev, &ww_ctx);
-	rdev->open_offset = 0;
-	regulator_unlock_dependent(rdev, &ww_ctx);
-
-	ret = regulator_allow_bypass(regulator, val);
-
-	return ret;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(reg_bypass_enable_fops, reg_debug_bypass_enable_get,
-			reg_debug_bypass_enable_set, "%llu\n");
-
-static int reg_debug_force_disable_set(void *data, u64 val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	int ret = 0;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	if (val > 0) {
-		ret = regulator_force_disable(regulator);
-		if (ret)
-			rdev_err(rdev, "force_disable failed, ret=%d\n", ret);
-	}
-
-	return ret;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(reg_force_disable_fops, reg_debug_enable_get,
-			reg_debug_force_disable_set, "%llu\n");
-
-#define MAX_DEBUG_BUF_LEN 50
-
-static ssize_t reg_debug_voltage_write(struct file *file,
-			const char __user *ubuf, size_t count, loff_t *ppos)
-{
-	struct regulator_dev *rdev = file->private_data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	char buf[MAX_DEBUG_BUF_LEN];
-	int ret, filled;
-	int min_uV, max_uV = -1;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	if (count < MAX_DEBUG_BUF_LEN) {
-		if (copy_from_user(buf, ubuf, count))
-			return -EFAULT;
-
-		buf[count] = '\0';
-		filled = sscanf(buf, "%d %d", &min_uV, &max_uV);
-
-		/* Check that both min and max voltage were specified. */
-		if (filled < 2 || min_uV < 0 || max_uV < min_uV) {
-			rdev_err(rdev, "incorrect values specified: \"%s\"; should be: \"min_uV max_uV\"\n",
-				buf);
-			return -EINVAL;
-		}
-
-		ret = regulator_set_voltage(regulator, min_uV, max_uV);
-		if (ret) {
-			rdev_err(rdev, "set voltage(%d, %d) failed, ret=%d\n",
-				min_uV, max_uV, ret);
-			return ret;
-		}
-	} else {
-		rdev_err(rdev, "voltage request string exceeds maximum buffer size\n");
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-static ssize_t reg_debug_voltage_read(struct file *file, char __user *ubuf,
-					size_t count, loff_t *ppos)
-{
-	struct regulator_dev *rdev = file->private_data;
-	char buf[MAX_DEBUG_BUF_LEN];
-	struct ww_acquire_ctx ww_ctx;
-	int voltage, ret;
-
-	regulator_lock_dependent(rdev, &ww_ctx);
-	voltage = regulator_get_voltage_rdev(rdev);
-	regulator_unlock_dependent(rdev, &ww_ctx);
-
-	ret = snprintf(buf, MAX_DEBUG_BUF_LEN - 1, "%d\n", voltage);
-
-	return simple_read_from_buffer(ubuf, count, ppos, buf, ret);
-}
-
-static const struct file_operations reg_voltage_fops = {
-	.open	= simple_open,
-	.read	= reg_debug_voltage_read,
-	.write	= reg_debug_voltage_write,
-};
-
-static int reg_debug_mode_set(void *data, u64 val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	unsigned int mode = val;
-	int ret;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	ret = regulator_set_mode(regulator, mode);
-	if (ret)
-		rdev_err(regulator->rdev, "set mode=%u failed, ret=%d\n",
-			mode, ret);
-
-	return ret;
-}
-
-static int reg_debug_mode_get(void *data, u64 *val)
-{
-	struct regulator_dev *rdev = data;
-	int mode;
-
-	mode = _regulator_get_mode(rdev);
-	if (mode < 0) {
-		rdev_err(rdev, "get mode failed, ret=%d\n", mode);
-		return mode;
-	}
-
-	*val = mode;
-
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(reg_mode_fops, reg_debug_mode_get, reg_debug_mode_set,
-			"%llu\n");
-
-static int reg_debug_set_load(void *data, u64 val)
-{
-	struct regulator_dev *rdev = data;
-	struct regulator *regulator = reg_debug_get_consumer(rdev);
-	int load = val;
-	int ret;
-
-	if (!regulator) {
-		rdev_err(rdev, "debug consumer missing\n");
-		return -ENODEV;
-	}
-
-	ret = regulator_set_load(regulator, load);
-	if (ret)
-		rdev_err(rdev, "set load=%d failed, ret=%d\n", load, ret);
-
-	return ret;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(reg_set_load_fops, reg_debug_mode_get,
-			reg_debug_set_load, "%llu\n");
-
-static void rdev_free_qti_debugfs(struct regulator_dev *rdev)
-{
-	if (!IS_ERR_OR_NULL(rdev)) {
-		regulator_put(rdev->debug_consumer);
-		rdev->debug_consumer = NULL;
-	}
-}
-
-static void rdev_init_qti_debugfs(struct regulator_dev *rdev)
-{
-	const struct regulator_ops *ops;
-	mode_t mode;
-
-	rdev->debug_consumer = reg_debug_get_consumer(rdev);
-	ops = rdev->desc->ops;
-
-	debugfs_create_file_unsafe("enable", 0644, rdev->debugfs, rdev,
-				&reg_enable_fops);
-	if (ops->set_bypass)
-		debugfs_create_file_unsafe("bypass", 0644, rdev->debugfs, rdev,
-					&reg_bypass_enable_fops);
-
-	mode = 0;
-	if (ops->is_enabled)
-		mode |= 0444;
-	if (ops->disable)
-		mode |= 0200;
-	if (mode)
-		debugfs_create_file_unsafe("force_disable", mode, rdev->debugfs,
-					rdev, &reg_force_disable_fops);
-
-	mode = 0;
-	if (ops->get_voltage || ops->get_voltage_sel)
-		mode |= 0444;
-	if (ops->set_voltage || ops->set_voltage_sel)
-		mode |= 0200;
-	if (mode)
-		debugfs_create_file_unsafe("voltage", mode, rdev->debugfs, rdev,
-					&reg_voltage_fops);
-
-	mode = 0;
-	if (ops->get_mode)
-		mode |= 0444;
-	if (ops->set_mode)
-		mode |= 0200;
-	if (mode)
-		debugfs_create_file_unsafe("mode", mode, rdev->debugfs, rdev,
-					&reg_mode_fops);
-
-	mode = 0;
-	if (ops->get_mode)
-		mode |= 0444;
-	if (ops->set_load || (ops->get_optimum_mode && ops->set_mode))
-		mode |= 0200;
-	if (mode)
-		debugfs_create_file_unsafe("load", mode, rdev->debugfs, rdev,
-					&reg_set_load_fops);
-}
-
-#else
-
-static inline void rdev_free_qti_debugfs(struct regulator_dev *rdev)
-{
-}
-
-static inline void rdev_init_qti_debugfs(struct regulator_dev *rdev)
-{
-}
-
-#endif /* CONFIG_REGULATOR_QTI_DEBUG */
-
-static int reg_debug_consumers_show(struct seq_file *m, void *v)
-{
-	struct regulator_dev *rdev = m->private;
-	struct ww_acquire_ctx ww_ctx;
-	struct regulator *reg;
-	const char *supply_name;
-
-	regulator_lock_dependent(rdev, &ww_ctx);
-
-	/* Print a header if there are consumers. */
-	if (rdev->open_count)
-		seq_printf(m, "%-32s EN    Min_uV   Max_uV  load_uA\n",
-			"Device-Supply");
-
-	list_for_each_entry(reg, &rdev->consumer_list, list) {
-		if (reg->supply_name)
-			supply_name = reg->supply_name;
-		else
-			supply_name = "(null)-(null)";
-
-		seq_printf(m, "%-32s %c   %8d %8d %8d\n", supply_name,
-			(reg->enable_count ? 'Y' : 'N'),
-			reg->voltage[PM_SUSPEND_ON].min_uV,
-			reg->voltage[PM_SUSPEND_ON].max_uV,
-			reg->uA_load);
-	}
-
-	regulator_unlock_dependent(rdev, &ww_ctx);
-
-	return 0;
-}
-
-static int reg_debug_consumers_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, reg_debug_consumers_show, inode->i_private);
-}
-
-static const struct file_operations reg_consumers_fops = {
-	.open		= reg_debug_consumers_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
 static void rdev_init_debugfs(struct regulator_dev *rdev)
 {
 	struct device *parent = rdev->dev.parent;
@@ -5242,10 +4914,8 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 	}
 
 	rdev->debugfs = debugfs_create_dir(rname, debugfs_root);
-	if (!rdev->debugfs) {
-		rdev_warn(rdev, "Failed to create debugfs directory\n");
-		return;
-	}
+	if (IS_ERR(rdev->debugfs))
+		rdev_dbg(rdev, "Failed to create debugfs directory\n");
 
 	debugfs_create_u32("use_count", 0444, rdev->debugfs,
 			   &rdev->use_count);
@@ -5253,10 +4923,6 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 			   &rdev->open_count);
 	debugfs_create_u32("bypass_count", 0444, rdev->debugfs,
 			   &rdev->bypass_count);
-	debugfs_create_file("consumers", 0444, rdev->debugfs, rdev,
-			    &reg_consumers_fops);
-
-	rdev_init_qti_debugfs(rdev);
 }
 
 static int regulator_register_resolve_supply(struct device *dev, void *data)
@@ -5695,15 +5361,11 @@ wash:
 	mutex_lock(&regulator_list_mutex);
 	regulator_ena_gpio_free(rdev);
 	mutex_unlock(&regulator_list_mutex);
-	put_device(&rdev->dev);
-	rdev = NULL;
 clean:
 	if (dangling_of_gpiod)
 		gpiod_put(config->ena_gpiod);
-	if (rdev && rdev->dev.of_node)
-		of_node_put(rdev->dev.of_node);
-	kfree(rdev);
 	kfree(config);
+	put_device(&rdev->dev);
 rinse:
 	if (dangling_cfg_gpiod)
 		gpiod_put(cfg->ena_gpiod);
@@ -5729,7 +5391,6 @@ void regulator_unregister(struct regulator_dev *rdev)
 	}
 
 	flush_work(&rdev->disable_work.work);
-	rdev_free_qti_debugfs(rdev);
 
 	mutex_lock(&regulator_list_mutex);
 
@@ -6076,6 +5737,7 @@ static void regulator_summary_lock(struct ww_acquire_ctx *ww_ctx)
 			ww_mutex_lock_slow(&new_contended_rdev->mutex, ww_ctx);
 			old_contended_rdev = new_contended_rdev;
 			old_contended_rdev->ref_cnt++;
+			old_contended_rdev->mutex_owner = current;
 		}
 
 		err = regulator_summary_lock_all(ww_ctx,
@@ -6129,74 +5791,6 @@ static int regulator_summary_show(struct seq_file *s, void *data)
 DEFINE_SHOW_ATTRIBUTE(regulator_summary);
 #endif /* CONFIG_DEBUG_FS */
 
-#ifdef CONFIG_REGULATOR_QTI_DEBUG
-static int _regulator_debug_print_enabled(struct device *dev, void *data)
-{
-	struct regulator_dev *rdev = dev_to_rdev(dev);
-	struct regulator *reg;
-	const char *supply_name;
-	int mode = -EPERM;
-	int uV = -EPERM;
-
-	if (_regulator_is_enabled(rdev) <= 0)
-		return 0;
-
-	uV = regulator_get_voltage_rdev(rdev);
-
-	if (rdev->desc->ops->get_mode)
-		mode = rdev->desc->ops->get_mode(rdev);
-
-	if (uV != -EPERM && mode != -EPERM)
-		pr_info("%s[%u] %d uV, mode=%d\n",
-			rdev_get_name(rdev), rdev->use_count, uV, mode);
-	else if (uV != -EPERM)
-		pr_info("%s[%u] %d uV\n",
-			rdev_get_name(rdev), rdev->use_count, uV);
-	else if (mode != -EPERM)
-		pr_info("%s[%u], mode=%d\n",
-			rdev_get_name(rdev), rdev->use_count, mode);
-	else
-		pr_info("%s[%u]\n", rdev_get_name(rdev), rdev->use_count);
-
-	/* Print a header if there are consumers. */
-	if (rdev->open_count)
-		pr_info("  %-32s EN    Min_uV   Max_uV  load_uA\n",
-			"Device-Supply");
-
-	list_for_each_entry(reg, &rdev->consumer_list, list) {
-		if (reg->supply_name)
-			supply_name = reg->supply_name;
-		else
-			supply_name = "(null)-(null)";
-
-		pr_info("  %-32s %d   %8d %8d %8d\n", supply_name,
-			reg->enable_count,
-			reg->voltage[PM_SUSPEND_ON].min_uV,
-			reg->voltage[PM_SUSPEND_ON].max_uV,
-			reg->uA_load);
-	}
-
-	return 0;
-}
-
-/**
- * regulator_debug_print_enabled - log enabled regulators
- *
- * Print the names of all enabled regulators and their consumers to the kernel
- * log if debug_suspend is set from debugfs.
- */
-void regulator_debug_print_enabled(void)
-{
-	if (likely(!debug_suspend))
-		return;
-
-	pr_info("Enabled regulators:\n");
-	class_for_each_device(&regulator_class, NULL, NULL,
-			     _regulator_debug_print_enabled);
-}
-EXPORT_SYMBOL(regulator_debug_print_enabled);
-#endif /* CONFIG_REGULATOR_QTI_DEBUG */
-
 static int __init regulator_init(void)
 {
 	int ret;
@@ -6204,8 +5798,8 @@ static int __init regulator_init(void)
 	ret = class_register(&regulator_class);
 
 	debugfs_root = debugfs_create_dir("regulator", NULL);
-	if (!debugfs_root)
-		pr_warn("regulator: Failed to create debugfs directory\n");
+	if (IS_ERR(debugfs_root))
+		pr_debug("regulator: Failed to create debugfs directory\n");
 
 #ifdef CONFIG_DEBUG_FS
 	debugfs_create_file("supply_map", 0444, debugfs_root, NULL,
@@ -6213,9 +5807,6 @@ static int __init regulator_init(void)
 
 	debugfs_create_file("regulator_summary", 0444, debugfs_root,
 			    NULL, &regulator_summary_fops);
-
-	debugfs_create_bool("debug_suspend", 0644, debugfs_root,
-			    &debug_suspend);
 #endif
 	regulator_dummy_init();
 

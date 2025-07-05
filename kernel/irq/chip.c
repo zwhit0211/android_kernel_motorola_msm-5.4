@@ -14,7 +14,6 @@
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/irqdomain.h>
-#include <linux/wakeup_reason.h>
 
 #include <trace/events/irq.h>
 
@@ -39,7 +38,7 @@ struct irqaction chained_action = {
  *	@irq:	irq number
  *	@chip:	pointer to irq chip description structure
  */
-int irq_set_chip(unsigned int irq, struct irq_chip *chip)
+int irq_set_chip(unsigned int irq, const struct irq_chip *chip)
 {
 	unsigned long flags;
 	struct irq_desc *desc = irq_get_desc_lock(irq, &flags, 0);
@@ -47,10 +46,7 @@ int irq_set_chip(unsigned int irq, struct irq_chip *chip)
 	if (!desc)
 		return -EINVAL;
 
-	if (!chip)
-		chip = &no_irq_chip;
-
-	desc->irq_data.chip = chip;
+	desc->irq_data.chip = (struct irq_chip *)(chip ?: &no_irq_chip);
 	irq_put_desc_unlock(desc, flags);
 	/*
 	 * For !CONFIG_SPARSE_IRQ make the irq show up in
@@ -511,22 +507,8 @@ static bool irq_may_run(struct irq_desc *desc)
 	 * If the interrupt is not in progress and is not an armed
 	 * wakeup interrupt, proceed.
 	 */
-	if (!irqd_has_set(&desc->irq_data, mask)) {
-#ifdef CONFIG_PM_SLEEP
-		if (unlikely(desc->no_suspend_depth &&
-			     irqd_is_wakeup_set(&desc->irq_data))) {
-			unsigned int irq = irq_desc_get_irq(desc);
-			const char *name = "(unnamed)";
-
-			if (desc->action && desc->action->name)
-				name = desc->action->name;
-
-			log_abnormal_wakeup_reason("misconfigured IRQ %u %s",
-						   irq, name);
-		}
-#endif
+	if (!irqd_has_set(&desc->irq_data, mask))
 		return true;
-	}
 
 	/*
 	 * If the interrupt is an armed wakeup source, mark it pending
@@ -1101,7 +1083,7 @@ irq_set_chained_handler_and_data(unsigned int irq, irq_flow_handler_t handle,
 EXPORT_SYMBOL_GPL(irq_set_chained_handler_and_data);
 
 void
-irq_set_chip_and_handler_name(unsigned int irq, struct irq_chip *chip,
+irq_set_chip_and_handler_name(unsigned int irq, const struct irq_chip *chip,
 			      irq_flow_handler_t handle, const char *name)
 {
 	irq_set_chip(irq, chip);
@@ -1316,50 +1298,6 @@ EXPORT_SYMBOL_GPL(handle_fasteoi_mask_irq);
 #endif /* CONFIG_IRQ_FASTEOI_HIERARCHY_HANDLERS */
 
 /**
- * irq_chip_set_parent_state - set the state of a parent interrupt.
- *
- * @data: Pointer to interrupt specific data
- * @which: State to be restored (one of IRQCHIP_STATE_*)
- * @val: Value corresponding to @which
- *
- * Conditional success, if the underlying irqchip does not implement it.
- */
-int irq_chip_set_parent_state(struct irq_data *data,
-			      enum irqchip_irq_state which,
-			      bool val)
-{
-	data = data->parent_data;
-
-	if (!data || !data->chip->irq_set_irqchip_state)
-		return 0;
-
-	return data->chip->irq_set_irqchip_state(data, which, val);
-}
-EXPORT_SYMBOL_GPL(irq_chip_set_parent_state);
-
-/**
- * irq_chip_get_parent_state - get the state of a parent interrupt.
- *
- * @data: Pointer to interrupt specific data
- * @which: one of IRQCHIP_STATE_* the caller wants to know
- * @state: a pointer to a boolean where the state is to be stored
- *
- * Conditional success, if the underlying irqchip does not implement it.
- */
-int irq_chip_get_parent_state(struct irq_data *data,
-			      enum irqchip_irq_state which,
-			      bool *state)
-{
-	data = data->parent_data;
-
-	if (!data || !data->chip->irq_get_irqchip_state)
-		return 0;
-
-	return data->chip->irq_get_irqchip_state(data, which, state);
-}
-EXPORT_SYMBOL_GPL(irq_chip_get_parent_state);
-
-/**
  * irq_chip_enable_parent - Enable the parent interrupt (defaults to unmask if
  * NULL)
  * @data:	Pointer to interrupt specific data
@@ -1496,7 +1434,6 @@ int irq_chip_retrigger_hierarchy(struct irq_data *data)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(irq_chip_retrigger_hierarchy);
 
 /**
  * irq_chip_set_vcpu_affinity_parent - Set vcpu affinity on the parent interrupt
@@ -1511,7 +1448,7 @@ int irq_chip_set_vcpu_affinity_parent(struct irq_data *data, void *vcpu_info)
 
 	return -ENOSYS;
 }
-EXPORT_SYMBOL_GPL(irq_chip_set_vcpu_affinity_parent);
+
 /**
  * irq_chip_set_wake_parent - Set/reset wake-up on the parent interrupt
  * @data:	Pointer to interrupt specific data
@@ -1588,6 +1525,17 @@ int irq_chip_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	return 0;
 }
 
+static struct device *irq_get_parent_device(struct irq_data *data)
+{
+	if (data->chip->parent_device)
+		return data->chip->parent_device;
+
+	if (data->domain)
+		return data->domain->dev;
+
+	return NULL;
+}
+
 /**
  * irq_chip_pm_get - Enable power for an IRQ chip
  * @data:	Pointer to interrupt specific data
@@ -1597,12 +1545,13 @@ int irq_chip_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
  */
 int irq_chip_pm_get(struct irq_data *data)
 {
+	struct device *dev = irq_get_parent_device(data);
 	int retval;
 
-	if (IS_ENABLED(CONFIG_PM) && data->chip->parent_device) {
-		retval = pm_runtime_get_sync(data->chip->parent_device);
+	if (IS_ENABLED(CONFIG_PM) && dev) {
+		retval = pm_runtime_get_sync(dev);
 		if (retval < 0) {
-			pm_runtime_put_noidle(data->chip->parent_device);
+			pm_runtime_put_noidle(dev);
 			return retval;
 		}
 	}
@@ -1620,10 +1569,11 @@ int irq_chip_pm_get(struct irq_data *data)
  */
 int irq_chip_pm_put(struct irq_data *data)
 {
+	struct device *dev = irq_get_parent_device(data);
 	int retval = 0;
 
-	if (IS_ENABLED(CONFIG_PM) && data->chip->parent_device)
-		retval = pm_runtime_put(data->chip->parent_device);
+	if (IS_ENABLED(CONFIG_PM) && dev)
+		retval = pm_runtime_put(dev);
 
 	return (retval < 0) ? retval : 0;
 }

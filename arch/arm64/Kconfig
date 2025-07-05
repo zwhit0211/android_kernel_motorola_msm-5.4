@@ -66,9 +66,6 @@ config ARM64
 	select ARCH_USE_QUEUED_RWLOCKS
 	select ARCH_USE_QUEUED_SPINLOCKS
 	select ARCH_SUPPORTS_MEMORY_FAILURE
-	select ARCH_SUPPORTS_SHADOW_CALL_STACK if CC_HAVE_SHADOW_CALL_STACK
-	select ARCH_SUPPORTS_LTO_CLANG
-	select ARCH_SUPPORTS_THINLTO
 	select ARCH_SUPPORTS_ATOMIC_RMW
 	select ARCH_SUPPORTS_INT128 if GCC_VERSION >= 50000 || CC_IS_CLANG
 	select ARCH_SUPPORTS_NUMA_BALANCING
@@ -101,7 +98,6 @@ config ARM64
 	select GENERIC_CPU_AUTOPROBE
 	select GENERIC_CPU_VULNERABILITIES
 	select GENERIC_EARLY_IOREMAP
-	select GENERIC_FIND_FIRST_BIT
 	select GENERIC_IDLE_POLL_SETUP
 	select GENERIC_IRQ_MULTI_HANDLER
 	select GENERIC_IRQ_PROBE
@@ -129,7 +125,7 @@ config ARM64
 	select HAVE_ARCH_KGDB
 	select HAVE_ARCH_MMAP_RND_BITS
 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS if COMPAT
-	select HAVE_ARCH_PREL32_RELOCATIONS if !LTO_CLANG
+	select HAVE_ARCH_PREL32_RELOCATIONS
 	select HAVE_ARCH_SECCOMP_FILTER
 	select HAVE_ARCH_STACKLEAK
 	select HAVE_ARCH_THREAD_STRUCT_WHITELIST
@@ -153,7 +149,7 @@ config ARM64
 	select HAVE_FTRACE_MCOUNT_RECORD
 	select HAVE_FUNCTION_TRACER
 	select HAVE_FUNCTION_ERROR_INJECTION
-	select HAVE_FUNCTION_GRAPH_TRACER if !SHADOW_CALL_STACK
+	select HAVE_FUNCTION_GRAPH_TRACER
 	select HAVE_GCC_PLUGINS
 	select HAVE_HW_BREAKPOINT if PERF_EVENTS
 	select HAVE_IRQ_TIME_ACCOUNTING
@@ -189,7 +185,6 @@ config ARM64
 	select SWIOTLB
 	select SYSCTL_EXCEPTION_TRACE
 	select THREAD_INFO_IN_TASK
-	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
 	help
 	  ARM 64-bit (AArch64) Linux support.
 
@@ -272,31 +267,14 @@ config GENERIC_CALIBRATE_DELAY
 	def_bool y
 
 config ZONE_DMA32
-	bool "Enable or Disable Zone DMA"
+	bool "Support DMA32 zone" if EXPERT
 	default y
-	help
-	  This option enables/disables the DMA zone.
 
 config ARCH_ENABLE_MEMORY_HOTPLUG
-    depends on !NUMA
-	def_bool y
-
-config ARCH_ENABLE_MEMORY_HOTREMOVE
 	def_bool y
 
 config SMP
 	def_bool y
-
-config HOTPLUG_SIZE_BITS
-	int "Memory hotplug block size(29 => 512MB 30 => 1GB)"
-	depends on SPARSEMEM
-	depends on MEMORY_HOTPLUG
-	default 30
-	help
-	 Selects granularity of hotplug memory. Block
-	 size for memory hotplug is represent as a power
-	 of 2.
-	 If unsure, stick with default value.
 
 config KERNEL_MODE_NEON
 	def_bool y
@@ -609,6 +587,46 @@ config ARM64_ERRATUM_1742098
 	  are only present if the cryptography extensions are present.
 	  All software should have a fallback implementation for CPUs
 	  that don't implement the cryptography extensions.
+
+	  If unsure, say Y.
+
+config ARM64_ERRATUM_3194386
+	bool "Cortex-*/Neoverse-*: workaround for MSR SSBS not self-synchronizing"
+	default y
+	help
+	  This option adds the workaround for the following errata:
+
+	  * ARM Cortex-A76 erratum 3324349
+	  * ARM Cortex-A77 erratum 3324348
+	  * ARM Cortex-A78 erratum 3324344
+	  * ARM Cortex-A78C erratum 3324346
+	  * ARM Cortex-A78C erratum 3324347
+	  * ARM Cortex-A710 erratam 3324338
+	  * ARM Cortex-A715 errartum 3456084
+	  * ARM Cortex-A720 erratum 3456091
+	  * ARM Cortex-A725 erratum 3456106
+	  * ARM Cortex-X1 erratum 3324344
+	  * ARM Cortex-X1C erratum 3324346
+	  * ARM Cortex-X2 erratum 3324338
+	  * ARM Cortex-X3 erratum 3324335
+	  * ARM Cortex-X4 erratum 3194386
+	  * ARM Cortex-X925 erratum 3324334
+	  * ARM Neoverse-N1 erratum 3324349
+	  * ARM Neoverse N2 erratum 3324339
+	  * ARM Neoverse-N3 erratum 3456111
+	  * ARM Neoverse-V1 erratum 3324341
+	  * ARM Neoverse V2 erratum 3324336
+	  * ARM Neoverse-V3 erratum 3312417
+
+	  On affected cores "MSR SSBS, #0" instructions may not affect
+	  subsequent speculative instructions, which may permit unexepected
+	  speculative store bypassing.
+
+	  Work around this problem by placing a Speculation Barrier (SB) or
+	  Instruction Synchronization Barrier (ISB) after kernel changes to
+	  SSBS. The presence of the SSBS special-purpose register is hidden
+	  from hwcaps and EL0 reads of ID_AA64PFR1_EL1, such that userspace
+	  will use the PR_SPEC_STORE_BYPASS prctl to change SSBS.
 
 	  If unsure, say Y.
 
@@ -999,37 +1017,8 @@ config ARCH_WANT_HUGE_PMD_SHARE
 config ARCH_HAS_CACHE_LINE_SIZE
 	def_bool y
 
-if ARM64 && IOMMU_DMA
-
-config ARM64_DMA_IOMMU_ALIGNMENT
-	int "Maximum PAGE_SIZE order of alignment for DMA IOMMU buffers"
-	range 4 9
-	default 9
-	help
-	  DMA mapping framework by default aligns all buffers to the smallest
-	  PAGE_SIZE order which is greater than or equal to the requested buffer
-	  size. This works well for buffers up to a few hundreds kilobytes, but
-	  for larger buffers it just a waste of address space. Drivers which has
-	  relatively small addressing window (like 64Mib) might run out of
-	  virtual space with just a few allocations.
-
-	  With this parameter you can specify the maximum PAGE_SIZE order for
-	  DMA IOMMU buffers. Larger buffers will be aligned only to this
-	  specified order. The order is expressed as a power of two multiplied
-	  by the PAGE_SIZE.
-
-endif
-
 config ARCH_ENABLE_SPLIT_PMD_PTLOCK
 	def_bool y if PGTABLE_LEVELS > 2
-
-config ARCH_MEMORY_PROBE
-	def_bool y
-	depends on MEMORY_HOTPLUG
-
-# Supported by clang >= 7.0
-config CC_HAVE_SHADOW_CALL_STACK
-	def_bool $(cc-option, -fsanitize=shadow-call-stack -ffixed-x18)
 
 config SECCOMP
 	bool "Enable seccomp to safely compute untrusted bytecode"
@@ -1127,14 +1116,6 @@ config XEN
 	select PARAVIRT
 	help
 	  Say Y if you want to run Linux in a Virtual Machine on Xen on ARM64.
-
-config QTI_QUIN_GVM
-	bool "Enable Support for QTI QUIN Virtual Machine"
-	help
-	  This enables support for Qualcomm Technologies, Inc.'s
-	  virtual machine on Quin platform. If you do not wish to
-	  build a kernel that runs on this platform or if you are
-	  unsure, say 'N' here.
 
 config FORCE_MAX_ZONEORDER
 	int
@@ -1538,33 +1519,6 @@ config ARM64_PTR_AUTH
 
 endmenu
 
-menu "ARMv8.4 architectural features"
-
-config ARM64_AMU_EXTN
-	bool "Enable support for the Activity Monitors Unit CPU extension"
-	default y
-	help
-	  The activity monitors extension is an optional extension introduced
-	  by the ARMv8.4 CPU architecture. This enables support for version 1
-	  of the activity monitors architecture, AMUv1.
-
-	  To enable the use of this extension on CPUs that implement it, say Y.
-
-	  Note that for architectural reasons, firmware _must_ implement AMU
-	  support when running on CPUs that present the activity monitors
-	  extension. The required support is present in:
-	    * Version 1.5 and later of the ARM Trusted Firmware
-
-	  For kernels that have this configuration enabled but boot with broken
-	  firmware, you may need to say N here until the firmware is fixed.
-	  Otherwise you may experience firmware panics or lockups when
-	  accessing the counter registers. Even if you are not observing these
-	  symptoms, the values returned by the register reads might not
-	  correctly reflect reality. Most commonly, the value read will be 0,
-	  indicating that the counter is not enabled.
-
-endmenu
-
 config ARM64_SVE
 	bool "ARM Scalable Vector Extension support"
 	default y
@@ -1699,11 +1653,7 @@ config CC_HAVE_STACKPROTECTOR_SYSREG
 
 config STACKPROTECTOR_PER_TASK
 	def_bool y
-	depends on STACKPROTECTOR && CC_HAVE_STACKPROTECTOR_SYSREG && STACKPROTECTOR_PER_TASK_ENABLED
-
-config STACKPROTECTOR_PER_TASK_ENABLED
-	default y
-	bool "Enable per task stack protector"
+	depends on STACKPROTECTOR && CC_HAVE_STACKPROTECTOR_SYSREG
 
 endmenu
 
@@ -1726,23 +1676,6 @@ config CMDLINE
 	  entering them here. As a minimum, you should specify the the
 	  root device (e.g. root=/dev/nfs).
 
-choice
-	prompt "Kernel command line type" if CMDLINE != ""
-	default CMDLINE_FROM_BOOTLOADER
-
-config CMDLINE_FROM_BOOTLOADER
-	bool "Use bootloader kernel arguments if available"
-	help
-	  Uses the command-line options passed by the boot loader. If
-	  the boot loader doesn't provide any, the default kernel command
-	  string provided in CMDLINE will be used.
-
-config CMDLINE_EXTEND
-	bool "Extend bootloader kernel arguments"
-	help
-	  The command-line arguments provided by the boot loader will be
-	  appended to the default kernel command string.
-
 config CMDLINE_FORCE
 	bool "Always use the default kernel command string"
 	help
@@ -1750,7 +1683,6 @@ config CMDLINE_FORCE
 	  loader passes other arguments to the kernel.
 	  This is useful if you cannot or don't want to change the
 	  command-line options your boot loader passes to the kernel.
-endchoice
 
 config EFI_STUB
 	bool
@@ -1786,49 +1718,6 @@ config DMI
 	  continue to boot on existing non-UEFI platforms.
 
 endmenu
-
-choice
-	prompt "Kernel compression method"
-	default BUILD_ARM64_KERNEL_COMPRESSION_GZIP
-	help
-	  Allows choice between gzip compressed or uncompressed
-	  kernel image. Decision is based on whether the bootloader
-	  can handle (un)compressed kernel images. Most BLs are capable
-	  of decomprssing kernel images and this is the default choice.
-
-config BUILD_ARM64_KERNEL_COMPRESSION_GZIP
-	bool "Build compressed kernel image"
-	help
-	  Build a kernel image using gzip
-	  compression. gzip is based on the DEFLATE
-	  algorithm. Check if your bootloader is
-	  capable of decompressing images.
-
-config BUILD_ARM64_UNCOMPRESSED_KERNEL
-	bool "Build uncompressed kernel image"
-	help
-	  Build a kernel image without
-	  compression. An uncompressed kernel
-	  image may improve performance in
-	  certain situations.
-endchoice
-
-config BUILD_ARM64_DT_OVERLAY
-	bool "enable DT overlay compilation support"
-	depends on OF
-	help
-	  This option enables support for DT overlay
-	  compilation. Enabling this option sets
-	  required flags to add DT overlay in the
-	  compilation.
-
-config TLB_CONF_HANDLER
-	bool "enable handler for TLB conflict"
-	help
-	  This option enables graceful handling of TLB
-	  conflict in EL2. Say yes here to enable TLB
-	  conflict handler.
-	  If unsure, Say n.
 
 config SYSVIPC_COMPAT
 	def_bool y
@@ -1872,124 +1761,3 @@ source "arch/arm64/kvm/Kconfig"
 if CRYPTO
 source "arch/arm64/crypto/Kconfig"
 endif
-
-config AF_NOISE_ELIMINATION
-	bool "For elimnating AF resonance noise"
-	default n
-	help
-	Enable it only for produts that suffering AF resonance noise.
-
-config AW882XX_PARAMS_FROM_BIN
-        bool "params is stored in bin file"
-        default n
-        help
-        Enable it only for params of smartPA is stored in bin file.
-
-config AW882XX_STEREO_SMARTPA
-        bool "aw dual smart pa"
-        default n
-        help
-        Enable it only for dual smart pa.
-
-config AW882XX_MAPSIZE_16K
-        bool "aw afe mapsize 16k"
-        default n
-        help
-        Enable it only for use 16k mapsize.
-
-config SND_SOC_AW87XXX
-        tristate "SoC Audio for awinic AW87XXX Smart K PA"
-        depends on I2C
-        help
-          This option enables support for AW87XXX Smart K PA.
-
-config SND_SOC_FS1815
-        tristate "SoC Audio for fs1815 Smart K PA"
-        depends on I2C
-        help
-          This option enables support for fs1815 K PA.
-
-config CAMERA_FLASH_PWM
-        bool "control flash"
-        default n
-        help
-        Enable it only for produts that control flash.
-
-config CAMERA_DISABLE_VSYNC_IRQ
-	bool "For cam disable vsync irq"
-	default n
-	help
-	Enable it to disable cam vsync irq.
-
-config CAM_SENSOR_PROBE_RETRY
-        bool "For sensor probe fail"
-        default n
-        help
-        Add retries for sensor id matching
-
-config CAMERA_SUB_DEVICE_PROBE
-	bool "For cam sub device probe after sensor"
-	default n
-	help
-	Enable it to probe cam sub devices after sensor
-
-config CAMERA_CCI_MASTER_CHANGE
-	bool "For cam cci master chance"
-        depends on CAMERA_SUB_DEVICE_PROBE
-	default n
-	help
-	Enable it to switch cci master i2c address.
-
-config CAMERA_CCI_ADDR_SWITCH
-	bool "For cam switch i2c address"
-	default n
-	help
-	Enable it to switch i2c address.
-
-config MMI_QC3P_TURBO_CHARGER
-        bool "QC3P turbo charging"
-        default n
-        help
-        Enable it only for products that support QC3P charging.
-
-config MMI_QC3P_WT6670_DETECTED
-        bool "QC3P WT6670"
-        select MMI_QC3P_TURBO_CHARGER
-        default n
-        help
-        Enable it only for products that support QC3P wt6670.
-
-config MMI_QC3P_Z350_DETECTED
-        bool "QC3P Z350"
-        select MMI_QC3P_TURBO_CHARGER
-        default n
-        help
-        Enable it only for products that support QC3P z350.
-
-config VIBRATOR_NOISE_CAMERA
-        bool "control vibrator noise for camera"
-        default n
-        help
-        Enable it only for products that need camera vibrator noise control.
-
-config CAMERA_FLASH_IIC_COMPATIBLE
-        bool "auto select iic flash suppliers"
-        default n
-        help
-        Enable it, this is automatically selected flash supplers.
-
-config MOT_DONGWOON_OIS_AF_DRIFT
-        bool "dongwoon ois af drift"
-        default n
-        help
-        Enable it will support dongwoon ois af drift.
-
-config MOT_SENSOR_PRE_POWERUP
-        bool "For sensor power up and initialization early"
-        default n
-        help
-        Enable it to power up and initialise early.
-
-config MOT_USB_DEBUG_LOG
-	bool "For usb debug log in factiry SW"
-	default n

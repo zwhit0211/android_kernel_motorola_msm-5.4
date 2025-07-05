@@ -15,9 +15,6 @@
 #include <linux/module.h>
 #include <linux/ftrace.h>
 #include <linux/kprobes.h>
-#include <linux/sched.h>
-#include <linux/sched/clock.h>
-#include <linux/sched/sysctl.h>
 
 #include "trace.h"
 
@@ -231,7 +228,6 @@ static void irqsoff_trace_open(struct trace_iterator *iter)
 {
 	if (is_graph(iter->tr))
 		graph_trace_open(iter);
-
 }
 
 static void irqsoff_trace_close(struct trace_iterator *iter)

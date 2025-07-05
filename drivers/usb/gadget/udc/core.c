@@ -87,7 +87,7 @@ EXPORT_SYMBOL_GPL(usb_ep_set_maxpacket_limit);
  * configurable, with more generic names like "ep-a".  (remember that for
  * USB, "in" means "towards the USB master".)
  *
- * This routine may be called in an atomic (interrupt) context..
+ * This routine must be called in process context.
  *
  * returns zero, or a negative error code.
  */
@@ -99,12 +99,10 @@ int usb_ep_enable(struct usb_ep *ep)
 		goto out;
 
 	/* UDC drivers can't handle endpoints with maxpacket size 0 */
-	if (usb_endpoint_maxp(ep->desc) == 0) {
-		/*
-		 * We should log an error message here, but we can't call
-		 * dev_err() because there's no way to find the gadget
-		 * given only ep.
-		 */
+	if (!ep->desc || usb_endpoint_maxp(ep->desc) == 0) {
+		WARN_ONCE(1, "%s: ep%d (%s) has %s\n", __func__, ep->address, ep->name,
+			  (!ep->desc) ? "NULL descriptor" : "maxpacket 0");
+
 		ret = -EINVAL;
 		goto out;
 	}
@@ -132,7 +130,7 @@ EXPORT_SYMBOL_GPL(usb_ep_enable);
  * gadget drivers must call usb_ep_enable() again before queueing
  * requests to the endpoint.
  *
- * This routine may be called in an atomic (interrupt) context.
+ * This routine must be called in process context.
  *
  * returns zero, or a negative error code.
  */
@@ -273,7 +271,9 @@ int usb_ep_queue(struct usb_ep *ep,
 {
 	int ret = 0;
 
-	if (WARN_ON_ONCE(!ep->enabled && ep->address)) {
+	if (!ep->enabled && ep->address) {
+		pr_debug("USB gadget: queue request to disabled ep 0x%x (%s)\n",
+				 ep->address, ep->name);
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -806,19 +806,6 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(usb_gadget_activate);
-
-#ifdef CONFIG_USB_FUNC_WAKEUP_SUPPORTED
-int usb_gadget_func_wakeup(struct usb_gadget *gadget, int interface_id)
-{
-	if (gadget->speed < USB_SPEED_SUPER)
-		return -EOPNOTSUPP;
-
-	if (!gadget->ops->func_wakeup)
-		return -EOPNOTSUPP;
-
-	return gadget->ops->func_wakeup(gadget, interface_id);
-}
-#endif
 
 /* ------------------------------------------------------------------------- */
 

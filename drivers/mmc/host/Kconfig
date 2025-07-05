@@ -466,11 +466,12 @@ config MMC_ALCOR
 	  of Alcor Micro PCI-E card reader
 
 config MMC_AU1X
-	tristate "Alchemy AU1XX0 MMC Card Interface support"
+	bool "Alchemy AU1XX0 MMC Card Interface support"
 	depends on MIPS_ALCHEMY
+	depends on MMC=y
 	help
 	  This selects the AMD Alchemy(R) Multimedia card interface.
-	  If you have a Alchemy platform with a MMC slot, say Y or M here.
+	  If you have a Alchemy platform with a MMC slot, say Y here.
 
 	  If unsure, say N.
 
@@ -489,8 +490,6 @@ config MMC_SDHCI_MSM
 	depends on ARCH_QCOM || (ARM && COMPILE_TEST)
 	depends on MMC_SDHCI_PLTFM
 	select MMC_SDHCI_IO_ACCESSORS
-	select MMC_CQHCI
-	select DEVFREQ_GOV_SIMPLE_ONDEMAND
 	help
 	  This selects the Secure Digital Host Controller Interface (SDHCI)
 	  support present in Qualcomm SOCs. The controller supports
@@ -634,7 +633,6 @@ config MMC_SDHCI_SPRD
 	depends on ARCH_SPRD
 	depends on MMC_SDHCI_PLTFM
 	select MMC_SDHCI_IO_ACCESSORS
-	select MMC_HSQ
 	help
 	  This selects the SDIO Host Controller in Spreadtrum
 	  SoCs, this driver supports R11(IP version: R11P0).
@@ -939,17 +937,6 @@ config MMC_CQHCI
 
 	  If unsure, say N.
 
-config MMC_HSQ
-	tristate "MMC Host Software Queue support"
-	help
-	  This selects the MMC Host Software Queue support. This may increase
-	  performance, if the host controller and its driver supports it.
-
-	  If you have a controller/driver supporting this interface, say Y or M
-	  here.
-
-	  If unsure, say N.
-
 config MMC_TOSHIBA_PCI
 	tristate "Toshiba Type A SD/MMC Card Interface Driver"
 	depends on PCI
@@ -1009,13 +996,14 @@ config MMC_SDHCI_XENON
 
 config MMC_SDHCI_OMAP
 	tristate "TI SDHCI Controller Support"
+	depends on ARCH_OMAP2PLUS || ARCH_KEYSTONE || COMPILE_TEST
 	depends on MMC_SDHCI_PLTFM && OF
 	select THERMAL
 	imply TI_SOC_THERMAL
 	help
 	  This selects the Secure Digital Host Controller Interface (SDHCI)
-	  support present in TI's DRA7 SOCs. The controller supports
-	  SD/MMC/SDIO devices.
+	  support present in TI's Keystone/OMAP2+/DRA7 SOCs. The controller
+	  supports SD/MMC/SDIO devices.
 
 	  If you have a controller with this interface, say Y or M here.
 
@@ -1033,28 +1021,3 @@ config MMC_SDHCI_AM654
 	  If you have a controller with this interface, say Y or M here.
 
 	  If unsure, say N.
-
-config SDC_QTI
-	tristate "Enable QTI specific code in MMC upstream driver"
-	depends on QGKI && MMC_SDHCI_MSM
-	default n
-	help
-	  This configuration flag allows adding QTI code in
-	  MMC upstream driver.
-
-config MMC_CQHCI_CRYPTO
-	tristate "CQHCI Crypto Engine Support"
-	depends on BLK_INLINE_ENCRYPTION
-	help
-	  Enable Crypto Engine Support in CQHCI.
-	  Enabling this makes it possible for the kernel to use the crypto
-	  capabilities of the CQHCI device (if present) to perform crypto
-	  operations on data being transferred to/from the device.
-
-config MMC_CQHCI_CRYPTO_QTI
-	tristate "Vendor specific CQHCI Crypto Engine Support"
-	depends on MMC_CQHCI_CRYPTO
-	help
-	 Enable Vendor Crypto Engine Support in CQHCI
-	 Enabling this allows kernel to use CQHCI crypto operations defined
-	 and implemented by QTI.

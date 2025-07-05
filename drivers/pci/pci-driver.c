@@ -439,16 +439,21 @@ static int pci_device_remove(struct device *dev)
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	struct pci_driver *drv = pci_dev->driver;
 
-	if (drv) {
-		if (drv->remove) {
-			pm_runtime_get_sync(dev);
-			drv->remove(pci_dev);
-			pm_runtime_put_noidle(dev);
-		}
-		pcibios_free_irq(pci_dev);
-		pci_dev->driver = NULL;
-		pci_iov_remove(pci_dev);
+	if (drv->remove) {
+		pm_runtime_get_sync(dev);
+		/*
+		 * If the driver provides a .runtime_idle() callback and it has
+		 * started to run already, it may continue to run in parallel
+		 * with the code below, so wait until all of the runtime PM
+		 * activity has completed.
+		 */
+		pm_runtime_barrier(dev);
+		drv->remove(pci_dev);
+		pm_runtime_put_noidle(dev);
 	}
+	pcibios_free_irq(pci_dev);
+	pci_dev->driver = NULL;
+	pci_iov_remove(pci_dev);
 
 	/* Undo the runtime PM settings in local_pci_probe() */
 	pm_runtime_put_sync(dev);
@@ -848,12 +853,6 @@ static int pci_pm_suspend_noirq(struct device *dev)
 		}
 	}
 
-#ifdef CONFIG_PCI_QTI
-	/* if d3hot is not supported bail out */
-	if (pci_dev->no_d3hot)
-		return 0;
-#endif
-
 	if (pci_dev->skip_bus_pm) {
 		/*
 		 * Either the device is a bridge with a child in D0 below it, or
@@ -945,18 +944,14 @@ static int pci_pm_resume_noirq(struct device *dev)
 	 * configuration here and attempting to put them into D0 again is
 	 * pointless, so avoid doing that.
 	 */
-	if (!(skip_bus_pm && pm_suspend_no_platform())
-#ifdef CONFIG_PCI_QTI
-		&& !pci_dev->no_d3hot
-#endif
-	)
+	if (!(skip_bus_pm && pm_suspend_no_platform()))
 		pci_pm_default_resume_early(pci_dev);
 
 	pci_fixup_device(pci_fixup_resume_early, pci_dev);
 	pcie_pme_root_status_cleanup(pci_dev);
 
 	if (!skip_bus_pm && prev_state == PCI_D3cold)
-		pci_bridge_wait_for_secondary_bus(pci_dev);
+		pci_bridge_wait_for_secondary_bus(pci_dev, "resume", PCI_RESET_WAIT);
 
 	if (pci_has_legacy_pm_support(pci_dev))
 		return pci_legacy_resume_early(dev);
@@ -1335,12 +1330,6 @@ static int pci_pm_runtime_suspend(struct device *dev)
 		return 0;
 	}
 
-#ifdef CONFIG_PCI_QTI
-	/* if d3hot is not supported bail out */
-	if (pci_dev->no_d3hot)
-		return 0;
-#endif
-
 	if (!pci_dev->state_saved) {
 		pci_save_state(pci_dev);
 		pci_finish_runtime_suspend(pci_dev);
@@ -1355,12 +1344,6 @@ static int pci_pm_runtime_resume(struct device *dev)
 	struct pci_dev *pci_dev = to_pci_dev(dev);
 	const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
 	pci_power_t prev_state = pci_dev->current_state;
-
-#ifdef CONFIG_PCI_QTI
-	/* we skipped d3hot processing so skip re-init */
-	if (pci_dev->no_d3hot)
-		goto skip_restore;
-#endif
 
 	/*
 	 * Restoring config space is necessary even if the device is not bound
@@ -1377,11 +1360,8 @@ static int pci_pm_runtime_resume(struct device *dev)
 	pci_fixup_device(pci_fixup_resume, pci_dev);
 
 	if (prev_state == PCI_D3cold)
-		pci_bridge_wait_for_secondary_bus(pci_dev);
+		pci_bridge_wait_for_secondary_bus(pci_dev, "resume", PCI_RESET_WAIT);
 
-#ifdef CONFIG_PCI_QTI
-skip_restore:
-#endif
 	if (pm && pm->runtime_resume)
 		rc = pm->runtime_resume(dev);
 

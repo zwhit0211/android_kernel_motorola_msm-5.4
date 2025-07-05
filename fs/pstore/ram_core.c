@@ -37,9 +37,6 @@ struct persistent_ram_buffer {
 	uint8_t     data[0];
 };
 
-#define MEM_TYPE_WCOMBINE	0
-#define MEM_TYPE_NONCACHED	1
-#define MEM_TYPE_NORMAL		2
 #define PERSISTENT_RAM_SIG (0x43474244) /* DBGC */
 
 static inline size_t buffer_size(struct persistent_ram_zone *prz)
@@ -193,7 +190,7 @@ static int persistent_ram_init_ecc(struct persistent_ram_zone *prz,
 {
 	int numerr;
 	struct persistent_ram_buffer *buffer = prz->buffer;
-	int ecc_blocks;
+	size_t ecc_blocks;
 	size_t ecc_total;
 
 	if (!ecc_info || !ecc_info->ecc_size)
@@ -414,10 +411,8 @@ static void *persistent_ram_vmap(phys_addr_t start, size_t size,
 	page_start = start - offset_in_page(start);
 	page_count = DIV_ROUND_UP(size + offset_in_page(start), PAGE_SIZE);
 
-	if (memtype == MEM_TYPE_NONCACHED)
+	if (memtype)
 		prot = pgprot_noncached(PAGE_KERNEL);
-	else if (memtype == MEM_TYPE_NORMAL)
-		prot = PAGE_KERNEL;
 	else
 		prot = pgprot_writecombine(PAGE_KERNEL);
 
@@ -584,6 +579,8 @@ struct persistent_ram_zone *persistent_ram_new(phys_addr_t start, size_t size,
 	raw_spin_lock_init(&prz->buffer_lock);
 	prz->flags = flags;
 	prz->label = kstrdup(label, GFP_KERNEL);
+	if (!prz->label)
+		goto err;
 
 	ret = persistent_ram_buffer_map(start, size, prz, memtype);
 	if (ret)

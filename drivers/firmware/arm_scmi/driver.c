@@ -173,8 +173,6 @@ static const int scmi_linux_errmap[] = {
 	-EPROTO,		/* SCMI_ERR_PROTOCOL */
 };
 
-static int scmi_mbox_free_channel(int id, void *p, void *data);
-
 static inline int scmi_to_linux_errno(int errno)
 {
 	int err_idx = -errno;
@@ -739,6 +737,39 @@ static int scmi_mailbox_check(struct device_node *np, int idx)
 					  idx, NULL);
 }
 
+static int scmi_mailbox_chan_validate(struct device *cdev)
+{
+	int num_mb, num_sh, ret = 0;
+	struct device_node *np = cdev->of_node;
+
+	num_mb = of_count_phandle_with_args(np, "mboxes", "#mbox-cells");
+	num_sh = of_count_phandle_with_args(np, "shmem", NULL);
+	/* Bail out if mboxes and shmem descriptors are inconsistent */
+	if (num_mb <= 0 || num_sh > 2 || num_mb != num_sh) {
+		dev_warn(cdev, "Invalid channel descriptor for '%s'\n",
+			 of_node_full_name(np));
+		return -EINVAL;
+	}
+
+	if (num_sh > 1) {
+		struct device_node *np_tx, *np_rx;
+
+		np_tx = of_parse_phandle(np, "shmem", 0);
+		np_rx = of_parse_phandle(np, "shmem", 1);
+		/* SCMI Tx and Rx shared mem areas have to be distinct */
+		if (!np_tx || !np_rx || np_tx == np_rx) {
+			dev_warn(cdev, "Invalid shmem descriptor for '%s'\n",
+				 of_node_full_name(np));
+			ret = -EINVAL;
+		}
+
+		of_node_put(np_tx);
+		of_node_put(np_rx);
+	}
+
+	return ret;
+}
+
 static int scmi_mbox_chan_setup(struct scmi_info *info, struct device *dev,
 				int prot_id, bool tx)
 {
@@ -761,6 +792,10 @@ static int scmi_mbox_chan_setup(struct scmi_info *info, struct device *dev,
 			return -EINVAL;
 		goto idr_alloc;
 	}
+
+	ret = scmi_mailbox_chan_validate(dev);
+	if (ret)
+		return ret;
 
 	cinfo = devm_kzalloc(info->dev, sizeof(*cinfo), GFP_KERNEL);
 	if (!cinfo)
@@ -844,21 +879,6 @@ scmi_create_protocol_device(struct device_node *np, struct scmi_info *info,
 	scmi_set_handle(sdev);
 }
 
-static void scmi_cleanup_mbox_channels(struct scmi_info *info)
-{
-	struct idr *idr;
-
-	/* free tx channels */
-	idr = &info->tx_idr;
-	idr_for_each(idr, scmi_mbox_free_channel, idr);
-	idr_destroy(&info->tx_idr);
-
-	/* free rx channels */
-	idr = &info->rx_idr;
-	idr_for_each(idr, scmi_mbox_free_channel, idr);
-	idr_destroy(&info->rx_idr);
-}
-
 static int scmi_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -905,7 +925,6 @@ static int scmi_probe(struct platform_device *pdev)
 	ret = scmi_base_protocol_init(handle);
 	if (ret) {
 		dev_err(dev, "unable to communicate with SCMI(%d)\n", ret);
-		scmi_cleanup_mbox_channels(info);
 		return ret;
 	}
 
@@ -977,7 +996,7 @@ static int scmi_remove(struct platform_device *pdev)
 }
 
 static const struct scmi_desc scmi_generic_desc = {
-	.max_rx_timeout_ms = 1000,	/* We may increase this if required */
+	.max_rx_timeout_ms = 30,	/* We may increase this if required */
 	.max_msg = 20,		/* Limited by MBOX_TX_QUEUE_LEN */
 	.max_msg_size = 128,
 };

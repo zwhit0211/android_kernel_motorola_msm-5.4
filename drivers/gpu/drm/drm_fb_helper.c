@@ -390,7 +390,11 @@ static void drm_fb_helper_dirty_blit_real(struct drm_fb_helper *fb_helper,
 	unsigned int y;
 
 	for (y = clip->y1; y < clip->y2; y++) {
-		memcpy(dst, src, len);
+		if (!fb_helper->dev->mode_config.fbdev_use_iomem)
+			memcpy(dst, src, len);
+		else
+			memcpy_toio((void __iomem *)dst, src, len);
+
 		src += fb->pitches[0];
 		dst += fb->pitches[0];
 	}
@@ -1335,6 +1339,9 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 			  fb->width, fb->height, fb->format->cpp[0] * 8);
 		return -EINVAL;
 	}
+
+	var->xres_virtual = fb->width;
+	var->yres_virtual = fb->height;
 
 	/*
 	 * Workaround for SDL 1.2, which is known to be setting all pixel format

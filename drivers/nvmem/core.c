@@ -27,9 +27,6 @@ struct nvmem_cell {
 	int			nbits;
 	struct device_node	*np;
 	struct nvmem_device	*nvmem;
-#ifdef CONFIG_QCOM_QFPROM_SYSFS
-	struct bin_attribute	attr;
-#endif
 	struct list_head	node;
 };
 
@@ -62,28 +59,6 @@ static int nvmem_reg_write(struct nvmem_device *nvmem, unsigned int offset,
 
 	return -EINVAL;
 }
-
-#ifdef CONFIG_QCOM_QFPROM_SYSFS
-static ssize_t bin_attr_nvmem_cell_read(struct file *filp, struct kobject *kobj,
-				    struct bin_attribute *attr,
-				    char *buf, loff_t pos, size_t count)
-{
-	struct nvmem_cell *cell;
-	size_t len;
-	u8 *data;
-
-	cell = attr->private;
-
-	data = nvmem_cell_read(cell, &len);
-	if (IS_ERR(data))
-		return -EINVAL;
-
-	len = min(len, count);
-	memcpy(buf, data, len);
-	kfree(data);
-	return len;
-}
-#endif
 
 static void nvmem_release(struct device *dev)
 {
@@ -132,9 +107,6 @@ static void nvmem_cell_drop(struct nvmem_cell *cell)
 {
 	blocking_notifier_call_chain(&nvmem_notifier, NVMEM_CELL_REMOVE, cell);
 	mutex_lock(&nvmem_mutex);
-#ifdef CONFIG_QCOM_QFPROM_SYSFS
-	device_remove_bin_file(&cell->nvmem->dev, &cell->attr);
-#endif
 	list_del(&cell->node);
 	mutex_unlock(&nvmem_mutex);
 	of_node_put(cell->np);
@@ -152,25 +124,8 @@ static void nvmem_device_remove_all_cells(const struct nvmem_device *nvmem)
 
 static void nvmem_cell_add(struct nvmem_cell *cell)
 {
-#ifdef CONFIG_QCOM_QFPROM_SYSFS
-	int rval;
-	struct bin_attribute *nvmem_cell_attr = &cell->attr;
-#endif
 	mutex_lock(&nvmem_mutex);
 	list_add_tail(&cell->node, &cell->nvmem->cells);
-
-#ifdef CONFIG_QCOM_QFPROM_SYSFS
-	/* add attr for this cell */
-	nvmem_cell_attr->attr.name = cell->name;
-	nvmem_cell_attr->attr.mode = 0444;
-	nvmem_cell_attr->private = cell;
-	nvmem_cell_attr->size = cell->bytes;
-	nvmem_cell_attr->read = bin_attr_nvmem_cell_read;
-	rval = device_create_bin_file(&cell->nvmem->dev, nvmem_cell_attr);
-	if (rval)
-		dev_err(&cell->nvmem->dev,
-			"Failed to create cell binary file %d\n", rval);
-#endif
 	mutex_unlock(&nvmem_mutex);
 	blocking_notifier_call_chain(&nvmem_notifier, NVMEM_CELL_ADD, cell);
 }
@@ -729,13 +684,13 @@ void nvmem_device_put(struct nvmem_device *nvmem)
 EXPORT_SYMBOL_GPL(nvmem_device_put);
 
 /**
- * devm_nvmem_device_get() - Get nvmem cell of device form a given id
+ * devm_nvmem_device_get() - Get nvmem device of device form a given id
  *
  * @dev: Device that requests the nvmem device.
  * @id: name id for the requested nvmem device.
  *
- * Return: ERR_PTR() on error or a valid pointer to a struct nvmem_cell
- * on success.  The nvmem_cell will be freed by the automatically once the
+ * Return: ERR_PTR() on error or a valid pointer to a struct nvmem_device
+ * on success.  The nvmem_device will be freed by the automatically once the
  * device is freed.
  */
 struct nvmem_device *devm_nvmem_device_get(struct device *dev, const char *id)
@@ -1128,6 +1083,8 @@ int nvmem_cell_write(struct nvmem_cell *cell, void *buf, size_t len)
 		return -EINVAL;
 
 	if (cell->bit_offset || cell->nbits) {
+		if (len != BITS_TO_BYTES(cell->nbits) && len != cell->bytes)
+			return -EINVAL;
 		buf = nvmem_cell_prepare_write_buffer(cell, buf, len);
 		if (IS_ERR(buf))
 			return PTR_ERR(buf);

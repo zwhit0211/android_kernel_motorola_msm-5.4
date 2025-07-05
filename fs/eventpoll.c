@@ -29,7 +29,6 @@
 #include <linux/mutex.h>
 #include <linux/anon_inodes.h>
 #include <linux/device.h>
-#include <linux/freezer.h>
 #include <linux/uaccess.h>
 #include <asm/io.h>
 #include <asm/mman.h>
@@ -1274,7 +1273,10 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 				break;
 			}
 		}
-		wake_up(&ep->wq);
+		if (sync)
+			wake_up_sync(&ep->wq);
+		else
+			wake_up(&ep->wq);
 	}
 	if (waitqueue_active(&ep->poll_wait))
 		pwake++;
@@ -1458,14 +1460,7 @@ static int ep_create_wakeup_source(struct epitem *epi)
 	struct wakeup_source *ws;
 
 	if (!epi->ep->ws) {
-#ifdef CONFIG_FS_EPOLL_WAKEUP_DEBUG
-		char full_ep_name[64];
-		snprintf(full_ep_name, 64, "eventpoll-%s-%d",
-			current->comm, current->pid);
-		epi->ep->ws = wakeup_source_register(NULL, full_ep_name);
-#else
 		epi->ep->ws = wakeup_source_register(NULL, "eventpoll");
-#endif
 		if (!epi->ep->ws)
 			return -ENOMEM;
 	}
@@ -1822,7 +1817,11 @@ static int ep_autoremove_wake_function(struct wait_queue_entry *wq_entry,
 {
 	int ret = default_wake_function(wq_entry, mode, sync, key);
 
-	list_del_init(&wq_entry->entry);
+	/*
+	 * Pairs with list_empty_careful in ep_poll, and ensures future loop
+	 * iterations see the cause of this wakeup.
+	 */
+	list_del_init_careful(&wq_entry->entry);
 	return ret;
 }
 
@@ -1937,8 +1936,8 @@ fetch_events:
 		write_unlock_irq(&ep->lock);
 
 		if (!eavail && !res)
-			timed_out = !freezable_schedule_hrtimeout_range(to, slack,
-									HRTIMER_MODE_ABS);
+			timed_out = !schedule_hrtimeout_range(to, slack,
+							      HRTIMER_MODE_ABS);
 
 		/*
 		 * We were woken up, thus go and try to harvest some events.
